@@ -186,7 +186,7 @@ function ScanPage({ id, theme }: { id: string; theme: Theme }) {
       if (r?.ok) {
         const s: Scan = await r.json()
         setScan(s)
-        const validating = Object.values(s.validations ?? {}).some((v) => ['queued', 'running', 'applying'].includes(v.status))
+        const validating = Object.values(s.validations ?? {}).some((v) => ['queued', 'running', 'applying', 'checking'].includes(v.status))
         if ((s.status === 'completed' || s.status === 'failed' || s.status === 'cancelled') && !validating) return
       }
       timer = window.setTimeout(load, 2000)

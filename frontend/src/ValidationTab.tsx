@@ -5,6 +5,8 @@ import { artifactUrl } from './types'
 export const VSTATUS: Record<string, { label: string; cls: string }> = {
   // a fix card in the fixed copy
   applying: { label: 'Applying…', cls: 'unrated' },
+  checking: { label: 'Checking with npm…', cls: 'unrated' },
+  conflicts: { label: '❌ Conflicts', cls: 'critical' },
   applied: { label: '✅ Applied', cls: 'low' },
   already_applied: { label: '✅ Already covered', cls: 'low' },
   applied_still_present: { label: '⚠️ Applied, still present', cls: 'medium' },
@@ -95,6 +97,10 @@ export default function ValidationTab({ scanId, cards, validations, onRerun }: {
           </div>
           <div className="explain"><div className="explain-label">{rep.summary.source}</div><p>{rep.summary.text}</p></div>
           <p className="small muted">{f!.approved} approved · {f!.rejected} rejected · {f!.awaiting_decision} awaiting a decision</p>
+          {!!(rep as any).skipped_incompatible?.length && (
+            <div className="small"><b>Skipped as incompatible ({(rep as any).skipped_incompatible.length}):</b>
+              <ul>{(rep as any).skipped_incompatible.map((x: any) => <li key={x.fix}>{x.fix}: <span className="muted">{x.why}</span></li>)}</ul></div>
+          )}
           <h3>Remaining risk</h3>
           {Object.entries(rep.remaining).map(([k, rows]) => (
             <div key={k} className="small"><b>{k.replace('_', ' ')}</b> ({rows.length}): <span className="mono">{rows.slice(0, 20).map((r) => `${r.package} (${r.score})`).join(', ')}</span></div>

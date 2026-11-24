@@ -340,3 +340,5 @@ button.reject { background: var(--bad); color: #2a0606; }
 .fixcard.v-applied_still_present { border-left: 4px solid var(--warn); }
 .fixcard.v-apply_failed, .fixcard.v-rolled_back { border-left: 4px solid var(--bad); }
 .fixcard.v-applying, .fixcard.v-manual { border-left: 4px solid var(--accent-2); }
+.fixcard.v-conflicts { border-left: 4px solid var(--bad); }
+.fixcard.v-checking { border-left: 4px solid var(--accent-2); }

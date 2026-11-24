@@ -91,6 +91,7 @@ not reload by itself). The frontend reloads by itself; just refresh the page.
 | `GUARDIAN_GUARDDOG=on` | Optional deep scan in Investigate (GuardDog). Adds ~4 to 6 minutes on Windows the first time | off |
 | `GUARDIAN_OSV_OFFLINE=1` | Use OSV's offline database instead of the online API | online |
 | `GUARDIAN_VALIDATE_TIMEOUT` | Seconds allowed for build + tests when validating a fix | 1200 |
+| `GUARDIAN_FIX_DRYRUN=off` | Skip the npm compatibility check of fix cards during the scan (faster scans) | on |
 | `GUARDIAN_ALLOW_UNSANDBOXED=1` | If Docker is not running, run build/tests locally without a sandbox (runs the repo's code on your machine) | off |
 | `GUARDIAN_DATA_DIR` | Where clones, evidence files and the database are stored | `backend\data` |
 
@@ -428,6 +429,12 @@ shortest), and for each route the lowest version of the package you control that
 picked, **after checking with OSV that the new versions have no known high or critical advisory** (versions
 that would introduce one are skipped, and the card says which). If any route has no safe version, the card
 uses an npm `overrides` pin instead.
+
+**npm compatibility check**: during the scan every package fix is tried on its own with an npm dry run
+(`npm install --package-lock-only --ignore-scripts` on a temporary copy: nothing installed, no scripts).
+A card npm cannot install shows "npm cannot install this fix…" with npm's reason, and Approve is disabled.
+On **Approve**, the same dry run is done against the fixed copy with all earlier fixes in it: if npm cannot
+combine them, the fix is not applied and the card shows **❌ Conflicts with <fix>** and npm's reason.
 
 **Card colour** follows the card's status: green applied, amber applied but still present, red couldn't
 apply or rolled back, blue applying or manual, grey rejected. "✓ Approved" itself is neutral.

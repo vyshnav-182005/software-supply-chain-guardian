@@ -139,6 +139,7 @@ export interface FixCard {
   ai: AiResult; compatibility: { jump: string | null; breaking_risk: string | null }
   plain?: { text: string; source: 'AI' | 'rule' }
   changes?: NonNullable<FixCard['change']>[]; routes?: string[]; vetting?: string
+  compat?: { ok: boolean; reason: string; blamed: string[] }
   packages?: { package: string; version: string; band: string; score_before: number; score_after: number }[]
 }
 
