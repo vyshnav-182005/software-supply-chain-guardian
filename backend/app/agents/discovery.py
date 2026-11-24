@@ -20,11 +20,13 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+
+from . import pydeps
 from urllib.parse import quote, urlparse
 
 SKIP_DIRS = {"node_modules", ".git", "vendor", "dist", "build", ".venv", "venv", "__pycache__"}
 UNSUPPORTED = {
-    "pyproject.toml": "pypi", "Pipfile": "pypi", "poetry.lock": "pypi", "Pipfile.lock": "pypi",
+    "Pipfile": "pypi", "poetry.lock": "pypi", "Pipfile.lock": "pypi",
     "pom.xml": "maven", "build.gradle": "maven", "build.gradle.kts": "maven",
     "Cargo.toml": "cargo", "Gemfile": "gem", "composer.json": "composer",
 }
@@ -251,8 +253,10 @@ def run(state: dict) -> tuple[dict, dict]:
                 if json.loads(f.read_text(encoding="utf-8")).get("workspaces"):
                     npm_workspace_roots.append(f.parent)
                 projects.append(npm_project(rel, f.parent, artifacts, len(projects), components, edges, warnings))
-            elif re.fullmatch(r"requirements.*\.txt", f.name):
-                projects.append(requirements_project(f"{rel}/{f.name}", f, components, edges))
+            elif re.fullmatch(r"requirements.*\.txt", f.name) or (
+                    f.name == "pyproject.toml" and "[project]" in f.read_text(encoding="utf-8", errors="replace")):
+                projects.append(pydeps.python_project(f"{rel}/{f.name}", f, artifacts, len(projects), components,
+                                                      edges, requirements_project))
             elif f.name == "go.mod":
                 projects.append(gomod_project(rel, f, components, edges))
             elif f.name in UNSUPPORTED:
