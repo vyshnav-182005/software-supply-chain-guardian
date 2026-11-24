@@ -465,9 +465,12 @@ def detect_app(project: Path) -> dict:
         procfile = re.search(r"^web:\s*(.+)$", _read(project / "Procfile"), re.M)
         start = "npm start" if "start" in scripts else procfile.group(1).strip() if procfile else None
         return {"runtime": "node", "image": node_image(project), "port": SMOKE_PORT, "env": ["NODE_ENV=production"],
-                "install": ["npm", "ci", "--include=dev", "--no-audit", "--no-fund", "--legacy-peer-deps"],
-                "local_install": [[NPM, "ci", "--include=dev", "--prefer-offline", "--no-audit", "--no-fund",
-                                   "--legacy-peer-deps"]],
+                # same peer-dependency rules as the lockfile was resolved with (no --legacy-peer-deps); a lockfile
+                # npm ci calls out of sync with package.json falls back to npm install
+                "install": ["sh", "-c", "npm ci --include=dev --no-audit --no-fund || "
+                                        "npm install --include=dev --no-audit --no-fund || "
+                                        "npm install --include=dev --no-audit --no-fund --legacy-peer-deps"],
+                "local_install": [[NPM, "ci", "--include=dev", "--prefer-offline", "--no-audit", "--no-fund"]],
                 "build": ["npm", "run", "build"] if "build" in scripts else None,
                 "test": ["npm", "test"] if "test" in scripts else None, "probe": NODE_PROBE, "start": start,
                 "why": None if start else "No start script, Procfile web process or Dockerfile CMD"}
@@ -671,6 +674,21 @@ def _local_build_and_test(project: Path, art: Path, log_name: str, plan: dict) -
             text, code = f"{out.stdout[-20000:]}\n{out.stderr[-20000:]}", out.returncode
         except subprocess.TimeoutExpired:
             text, code = "(timed out)", "timeout"
+        # npm ci refuses a lockfile out of sync with package.json (or resolved with other peer-dependency rules):
+        # then npm install, and if npm's peer-dependency check fails, npm install --legacy-peer-deps
+        retries = [[NPM, "install", *cmd[2:]], [NPM, "install", *cmd[2:], "--legacy-peer-deps"]] \
+            if cmd[:2] == [NPM, "ci"] else []
+        while code != 0 and retries and ("are in sync" in text or "ERESOLVE" in text):
+            log.append(f"$ {' '.join(map(str, cmd))}  [{name}, on this machine]\n{text}\n"
+                       "(npm could not install from package-lock.json as is: trying again with npm install)")
+            cmd = retries.pop(0)
+            try:
+                out = subprocess.run(cmd, cwd=project, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                     timeout=max(deadline - time.time(), 1), env=local_env(project, plan, ci, port),
+                                     stdin=subprocess.DEVNULL)
+                text, code = f"{out.stdout[-20000:]}\n{out.stderr[-20000:]}", out.returncode
+            except subprocess.TimeoutExpired:
+                text, code = "(timed out)", "timeout"
         log.append(f"$ {' '.join(map(str, cmd))}  [{name}, on this machine]\n{text}")
         (art / log_name).write_text("\n".join(log), encoding="utf-8")
         if code != 0:
