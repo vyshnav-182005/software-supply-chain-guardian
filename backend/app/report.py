@@ -25,6 +25,7 @@ def build(scan_id: str) -> dict:
     scan = db.get(scan_id)
     res = scan["results"]
     decisions, validations = db.decisions(scan_id), db.validations(scan_id)
+    combined = validations.pop("combined", None)  # all approved fixes applied together (separate from per-card runs)
     risks = res.get("prioritize", {}).get("risks", [])
     cards = res.get("remediate", {}).get("cards", [])
     risk_by_id = {r["id"]: r for r in risks}
@@ -85,7 +86,18 @@ def build(scan_id: str) -> dict:
         "validated": {s: vstat.count(s) for s in ("verified", "fixed_untested", "fixed_tests_failed", "not_fixed", "manual", "error")},
         "packages_resolved_by_verified_fixes": len(remaining["resolved"]),
     }
-    report = {"facts": facts, "remaining": remaining, "audit_trail": trail,
+    if combined and combined.get("comparison"):
+        cmp_, smoke = combined["comparison"], (combined.get("build") or {}).get("smoke") or {}
+        reasons: dict = {}
+        for x in cmp_["remaining"]:
+            reasons[x["reason"]] = reasons.get(x["reason"], 0) + 1
+        facts["combined"] = {"status": combined["status"], "fixes_applied": len(combined.get("applied", [])),
+                             "fixes_not_applied": len(combined.get("not_applied", [])),
+                             "advisories_before": cmp_["advisories_before"], "advisories_after": cmp_["advisories_after"],
+                             "severity_before": cmp_["severity_before"], "severity_after": cmp_["severity_after"],
+                             "app_runs": smoke.get("status") == "passed", "app_http_status": smoke.get("http_status"),
+                             "build": (combined.get("build") or {}).get("status"), "remaining_by_reason": reasons}
+    report = {"facts": facts, "remaining": remaining, "audit_trail": trail, "combined": combined,
               "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     report["summary"] = summarize(facts)
     return report
@@ -134,4 +146,13 @@ def markdown(rep: dict) -> str:
                 f"- Decision: {d['decision']} by {d['by']} at {d['at']}" if d else "- Decision: awaiting",
                 f"- Validation: {v['status']} - {v['reason']} (build/test: {v['build']}, {v['build_mode']}; rescan: {v['rescan']})"
                 if v else "- Validation: not run", ""]
+    c = rep.get("combined")
+    if c and c.get("comparison"):
+        cf = f["combined"]
+        out += ["## All approved fixes together (branch fix/combined)", "",
+                f"- Result: {c['status']} - {c.get('reason', '')}",
+                f"- Advisories: {cf['advisories_before']} -> {cf['advisories_after']}",
+                f"- App: {'runs, GET / answered HTTP ' + str(cf['app_http_status']) if cf['app_runs'] else 'not confirmed running'}",
+                "", "| Remaining advisory | Severity | Why it is still there |", "|---|---|---|"]
+        out += [f"| {x['package']} {x['id']} | {x['severity']} | {x['reason']} |" for x in c["comparison"]["remaining"]]
     return "\n".join(out)

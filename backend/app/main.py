@@ -82,6 +82,18 @@ def revalidate(scan_id: str, card_id: str, bg: BackgroundTasks):
     return {"status": "queued"}
 
 
+@app.post("/api/scans/{scan_id}/combined")
+def validate_combined(scan_id: str, bg: BackgroundTasks):
+    """Apply all approved fixes together on fix/combined, build, start the app, test and rescan once."""
+    if not any(d["decision"] == "approved" for d in db.decisions(scan_id).values()):
+        raise HTTPException(409, "Approve at least one fix first")
+    if db.validations(scan_id).get(validate.COMBINED, {}).get("status") in ("queued", "running"):
+        raise HTTPException(409, "The combined validation is already running")
+    db.save_validation(scan_id, validate.COMBINED, {"card_id": validate.COMBINED, "status": "queued", "steps": []})
+    bg.add_task(validate.run_combined, scan_id)
+    return {"status": "queued"}
+
+
 @app.delete("/api/scans/{scan_id}/validations/{card_id}")
 def cancel_validation(scan_id: str, card_id: str):
     """Cancel a queued validation, or stop a running one before its next step."""
