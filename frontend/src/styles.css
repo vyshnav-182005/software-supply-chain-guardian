@@ -302,7 +302,12 @@ td > .level:first-child { margin-left: 0; }
 .formula b { font-family: 'JetBrains Mono', monospace; }
 .approver { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; }
 .approver input { margin-left: 8px; }
-.fixcard.approved { border-left: 4px solid var(--ok); } .fixcard.rejected { border-left: 4px solid var(--bad); }
+.fixcard.rejected { border-left: 4px solid var(--muted); opacity: .8; }
+/* approved cards are coloured by their validation result, not by the approval itself */
+.fixcard.v-verified { border-left: 4px solid var(--ok); }
+.fixcard.v-fixed_untested, .fixcard.v-fixed_tests_failed { border-left: 4px solid var(--warn); }
+.fixcard.v-not_fixed, .fixcard.v-error { border-left: 4px solid var(--bad); }
+.fixcard.v-queued, .fixcard.v-running, .fixcard.v-manual, .fixcard.v-cancelled { border-left: 4px solid var(--accent-2); }
 .fix-head { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; }
 .score-move { white-space: nowrap; }
 .fix-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
@@ -312,7 +317,7 @@ td > .level:first-child { margin-left: 0; }
 .decision input { flex: 1; min-width: 220px; }
 button.approve { background: var(--ok); color: #04231a; }
 button.reject { background: var(--bad); color: #2a0606; }
-.decided { font-size: 13.5px; } .decided.approved { color: var(--ok); } .decided.rejected { color: var(--bad); }
+.decided { font-size: 13.5px; color: var(--text); }
 @media (max-width: 1000px) { .fix-grid { grid-template-columns: 1fr; } .pipeline { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 .badge.cancelled, .badge.cancelling { background: rgba(251, 191, 36, .15); color: var(--warn); }
 .explain { background: var(--panel-2); border-radius: 8px; padding: 12px 14px; margin: 10px 0; }

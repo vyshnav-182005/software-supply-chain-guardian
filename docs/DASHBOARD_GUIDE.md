@@ -418,12 +418,23 @@ vulnerabilities, 5 pin-and-review cards for risky packages, 7 config fixes.
   reduction (advisories and CVEs removed, what is still open), rollback, version jump
   (patch / minor / major), the AI's breaking-change notes and the app code that uses the package.
 
+**How the fix version is chosen**: every route that pulls in the vulnerable version is followed (not just the
+shortest), and for each route the lowest version of the package you control that brings a fixed version is
+picked, **after checking with OSV that the new versions have no known high or critical advisory** (versions
+that would introduce one are skipped, and the card says which). If any route has no safe version, the card
+uses an npm `overrides` pin instead.
+
+**Card colour**: rejected cards are grey. Approved cards are coloured by their validation result: green ✅
+verified, amber ⚠️ fixed but not tested / tests failed, red ❌ not fixed or new risk, blue while queued or
+running. "✓ Approved" itself is neutral.
+
 **Card types (actions)**
 
 | Action | When | What it changes |
 |---|---|---|
 | upgrade | the vulnerable package is direct | its version in `package.json` |
 | upgrade-parent | it is pulled in by a package you list | that package's version (lowest one that brings a safe version) |
+| upgrade-all | the vulnerable version is pulled in by **several** of your packages | one change per route, all in one card, so every path is fixed |
 | relock | your package already allows a safe version | only the lockfile (`npm update <pkg>`) |
 | override | no version of your package brings a safe one | pins it with npm `overrides` |
 | pin | risky package, no CVE | pins the exact reviewed version with `overrides` and flags it for review (risk frozen, not removed) |
@@ -444,8 +455,10 @@ For each approved card, the steps run in order (live):
 2. **apply**: the card's exact change (shown as a diff). For config fixes the action's commit SHA is
    looked up with `git ls-remote` and the image digest from its registry.
 3. **relock**: `npm install --package-lock-only --ignore-scripts` (package changes only). Log link.
-4. **build / test**: in Docker: `npm ci` (network on, to download), then `npm run build` and
-   `npm test` with the network off, 2 CPUs, 4 GB memory, a time limit and no secrets. Without Docker
+4. **build / test**: in Docker: `npm ci` and `npm run build` with the network on (downloads, and
+   e.g. Angular inlining Google Fonts), then `npm test` with the network off; 2 CPUs, 4 GB memory, a
+   time limit and no secrets. If the sandbox itself stops it (no network, a database the tests need,
+   a missing tool, out of memory) the result is "not tested", not "tests failed". Without Docker
    this step is skipped and says why. Log link.
 5. **rescan**: the same rule-based agents on the fixed copy (no AI), then a comparison.
 

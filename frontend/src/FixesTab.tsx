@@ -60,7 +60,7 @@ function Card({ c, pkgs, scanId, decision, validation, onDecided }: { c: FixCard
   }
 
   return (
-    <section className={`card fixcard ${decision?.decision ?? ''}`}>
+    <section className={`card fixcard ${decision?.decision === 'rejected' ? 'rejected' : ''} ${validation ? `v-${validation.status}` : ''}`}>
       <div className="fix-head">
         <h2>{c.title}</h2>
         <div className="score-move" title="Risk score from Prioritized risks, before → after this fix">
@@ -103,6 +103,9 @@ function Card({ c, pkgs, scanId, decision, validation, onDecided }: { c: FixCard
                   : <p className="small">No version change possible.</p>}
               {c.patch && <pre className="code diff">{c.patch}</pre>}
               {pkgs.length > 1 && <p className="small muted">Fixes {pkgs.map((p) => `${p.package} ${p.version}`).join(' and ')} in one change</p>}
+              {(c.changes?.length ?? 0) > 1 && <ul className="small">{c.changes!.map((x, i) => <li key={i} className="mono">{x.field === 'lockfile' ? `lockfile: ${x.package} → ${x.to}` : `${x.package}: ${x.from} → ${x.to} (${x.jump})`}</li>)}</ul>}
+              {(c.routes?.length ?? 0) > 1 && <p className="small muted">Routes that pull it in: {c.routes!.join(' · ')}</p>}
+              {c.vetting && <p className="small muted">{c.vetting}</p>}
             </div>
             <div>
               <h3>Risk reduction</h3>
