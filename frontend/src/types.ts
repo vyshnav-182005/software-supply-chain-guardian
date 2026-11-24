@@ -107,7 +107,6 @@ export interface Investigation {
   scope: string; direct: boolean; path: string[] | null; mal_advisories: string[]
   tarball: { file?: string; size?: number; integrity?: string; integrity_match?: boolean; command?: string; error?: string }
   install_scripts: { hook: string; command: string }[]
-  guarddog: { status: string; hits: Hit[]; reason?: string }
   static?: { status: string; hits: Hit[] }
   rule_verdict: string; rule_reason: string; code: Record<string, string[]>; hook_lines?: number[]
   ai: AiResult; verdict: 'malicious' | 'risky' | 'harmless' | 'unknown'; confidence: number | null
@@ -216,7 +215,7 @@ export interface Results {
     bundles: Bundle[]
     artifacts: { json: string; markdown: string }
   }
-  investigate?: { items: Investigation[]; config_items?: ConfigItem[]; config_counts?: Record<string, number>; not_investigated?: string[]; counts: Record<string, number>; guarddog: { status: string; tool?: string; seconds?: number; reason?: string }; llm: LlmStatus }
+  investigate?: { items: Investigation[]; config_items?: ConfigItem[]; config_counts?: Record<string, number>; not_investigated?: string[]; counts: Record<string, number>; llm: LlmStatus }
   prioritize?: {
     risks: Risk[]; counts: Record<string, number>; reachability: Record<string, number>
     feeds: { kev: { status: string; source: string; catalog_version?: string; entries?: number; fetched?: string; reason?: string }

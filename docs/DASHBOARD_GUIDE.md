@@ -88,7 +88,6 @@ not reload by itself). The frontend reloads by itself; just refresh the page.
 | `GUARDIAN_LLM_MODEL` | Which model to use | `llama-3.3-70b-versatile` (`openai/gpt-oss-20b` also works) |
 | `GUARDIAN_LLM_BASE_URL` | Any OpenAI-compatible endpoint | Groq |
 | `GITHUB_TOKEN` | Optional. Raises GitHub's limit (60 per hour) for changelog lookups in Recommend Fix | none |
-| `GUARDIAN_GUARDDOG=on` | Optional deep scan in Investigate (GuardDog). Adds ~4 to 6 minutes on Windows the first time | off |
 | `GUARDIAN_OSV_OFFLINE=1` | Use OSV's offline database instead of the online API | online |
 | `GUARDIAN_VALIDATE_TIMEOUT` | Seconds allowed for build + tests when validating a fix | 1200 |
 | `GUARDIAN_FIX_DRYRUN=off` | Skip the npm compatibility check of fix cards during the scan (faster scans) | on |
