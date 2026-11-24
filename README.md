@@ -7,7 +7,7 @@ output shows up on the dashboard.
 | # | Agent | Status | What it does |
 |---|-------|--------|--------------|
 | 1 | Repository Intake | built | Shallow clone (`--depth 1`, `core.symlinks=false`), records commit SHA, branch, author |
-| 2 | Discovery | built | Finds manifests/lockfiles; direct + transitive deps from `package-lock.json` (v2/v3). No lockfile → generates one with `npm install --package-lock-only --ignore-scripts` and records command, npm version, time and sha256 as evidence. `requirements*.txt` and `go.mod` give direct deps; other ecosystems are reported as coverage gaps |
+| 2 | Discovery | built | Finds manifests/lockfiles; direct + transitive deps from `package-lock.json` (v2/v3). No lockfile → generates one with `npm install --package-lock-only --ignore-scripts` and records command, npm version, time and sha256 as evidence. Python (`requirements*.txt`, `pyproject.toml`): full tree resolved with `uv pip compile` (nothing installed). `go.mod` gives direct deps; other ecosystems are reported as coverage gaps |
 | 3 | SBOM | built | Merged CycloneDX 1.5 JSON (purls, scopes, licenses, hashes, dependency tree), cross-checked against `npm sbom` |
 | 4 | Dependency graph | built | Nodes/edges, shortest introduction path per component, depth histogram, most depended-on packages |
 | 5 | Container & CI/CD inspection | built | Dockerfile base-image pinning and risky `RUN`s; GitHub Actions pinning, `pull_request_target`, `write-all`, script injection; all with file:line |
@@ -16,9 +16,9 @@ output shows up on the dashboard.
 | 8 | Investigation & evidence | built | Evidence bundle per finding (facts / inference / unknowns, initial risk), Day 1 checklist, `report.md` + `report.json` |
 | 9 | Investigate | built | Flagged packages: `npm pack --ignore-scripts` (never run), tarball hash vs lockfile, static checks on install hooks (download/exec/obfuscation/secrets/URLs), OSV `MAL-`. Workflow/Dockerfile findings: reads the lines, built-in checks (trusted publisher, official image + tag, curl\|sh, pull_request_target + PR checkout). AI verdict malicious/risky/harmless with file:line for everything not already harmless by rule |
 | 10 | Prioritize | built | `min(10, CVSS × U × D × P × E × R)` with CISA KEV + EPSS; AI only labels reachability (R 1.0 / 1.0 / 0.7). Risky/malicious Investigate verdicts get rows too: malicious 10, risky 6.0 stand-in (× U × D × P; 1.0 each for repo config), or a 4.0 floor on an existing CVE row |
-| 11 | Recommend Fix | built | For every band, critical to low: lowest OSV-vetted upgrade of the package(s) you control on every route that resolves to a fixed version (npm registry), else lockfile refresh or `overrides`; pin-and-review cards for supply-chain risks; config cards (pin action SHA, image digest, `npm ci`, trigger/permissions); plain-English explanation per card |
+| 11 | Recommend Fix | built | For every band, critical to low: lowest OSV-vetted upgrade of the package(s) you control on every route that resolves to a fixed version (npm registry), else lockfile refresh or `overrides`; Python: `==safe` for a direct requirement, a `>=safe` line for a pulled-in one (PyPI, OSV-vetted, uv dry run); pin-and-review cards for supply-chain risks; config cards (pin action SHA, image digest, `npm ci`, trigger/permissions); plain-English explanation per card |
 | 12 | Human Approval | built | Approve / Reject per fix card; **Approve applies the change** to one fixed copy of the app (branch `fix/guardian`), fixes adding up |
-| 13 | Fixed app | built | Build, run & verify: relock, Docker build, app check (GET / in the sandbox), tests, rescan; rolls back a fix that breaks the build; runs the fixed app on http://localhost:3001; original vs fixed with reasons for what remains; downloadable patch |
+| 13 | Fixed app | built | Build, run & verify: relock, Docker build (Node or Python), app check (GET / in the sandbox; start command from `npm start`, Procfile, Django, FastAPI, Flask or Dockerfile CMD), tests, rescan; every changed project of a monorepo; rolls back a fix that breaks the build; runs the fixed app on http://localhost:3001; original vs fixed with reasons for what remains; downloadable patch |
 | 14 | Report | built | Before/after risk and SBOM, remaining risk (open, rejected, accepted, awaiting), audit trail, AI summary limited to verified numbers; Markdown/JSON export |
 
 AI: any OpenAI-compatible model via `backend/.env` (default `llama-3.3-70b-versatile` on Groq; `openai/gpt-oss-20b` also works).
@@ -36,7 +36,7 @@ Full explanation of every agent and every dashboard element: [docs/DASHBOARD_GUI
 
 ## Run
 
-Needs Python 3.11+, Node 20+ (with npm 9.5+ for `npm sbom`), git, and
+Needs Python 3.11+, [uv](https://docs.astral.sh/uv/) (resolves Python projects), Node 20+ (with npm 9.5+ for `npm sbom`), git, and
 [OSV-Scanner](https://github.com/google/osv-scanner) on PATH. [Trivy](https://github.com/aquasecurity/trivy) is optional (cross-check).
 On Windows: `scoop install osv-scanner trivy`.
 

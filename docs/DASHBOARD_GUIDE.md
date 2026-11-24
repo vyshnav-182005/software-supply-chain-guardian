@@ -451,6 +451,13 @@ apply or rolled back, blue applying or manual, grey rejected. "✓ Approved" its
 | config | risky workflow/Dockerfile finding | pin action to a commit SHA, pin image digest, `npm ci`, or fix trigger/permissions |
 | replace | no fixed version exists (e.g. marsdb) | needs a person: replace or limit use (Approve is disabled) |
 | remove | known malware | needs a person: remove it and whatever depends on it |
+| constrain | Python: a vulnerable package pulled in by another one | adds a `name>=safe` line to `requirements.txt` (direct Python packages use **upgrade**: `name==safe`) |
+
+**Python projects** (`requirements*.txt`, or `pyproject.toml` with `[project]`): the full tree is resolved with
+`uv pip compile` (nothing installed). A fix edits the requirements file, keeping its encoding (UTF-16 from
+PowerShell `pip freeze` works). The safe version is the lowest PyPI release at or above the advisory's fixed
+version that OSV lists with no high/critical advisory, and `uv` checks that the edited file still resolves.
+A fix that needs a change in `pyproject.toml` is shown as a manual card.
 
 ---
 
@@ -460,12 +467,20 @@ apply or rolled back, blue applying or manual, grey rejected. "✓ Approved" its
 
 Every approved fix is already applied to one copy of the project. **Build, run & verify fixed app** then:
 
-1. **relock**: regenerates `package-lock.json` for all the applied fixes (no scripts run);
-2. **build**: in Docker, `npm ci` and `npm run build` (network on for downloads such as Google Fonts);
-3. **app check**: starts the app inside the sandbox (network off) and requests `GET /` on port 3000:
-   "App check in the sandbox: GET / → HTTP 200" plus the end of the app's log;
-4. **tests**: `npm test` with the network off. If the sandbox stops them (they need Chrome or a database,
-   no network, out of memory) that is reported as "not run", not as a failure;
+1. **relock**: regenerates `package-lock.json` for all the applied fixes (no scripts run); for Python, checks
+   with `uv` that the edited requirements still resolve;
+2. **build**: in Docker. Node: `npm ci` and `npm run build`. Python: a virtual environment in the copy
+   (`.guardian-venv`) and `pip install -r requirements.txt`. Network on for downloads;
+3. **app check**: starts the app inside the sandbox (network off) and requests `GET /`. The start command is
+   detected: Node `npm start` (port 3000); Python, in this order, the Procfile `web:` line, Django
+   `manage.py runserver`, a FastAPI app with uvicorn, a Flask app, the Dockerfile `CMD` (port from `EXPOSE`,
+   else 8000). The app gets its port in `PORT`. Shows "GET / → HTTP 200" plus the end of the app's log.
+   No start command found → "no app to start", with what was looked for;
+4. **tests**: `npm test`, or `pytest` when the project lists it and has tests, with the network off. If the
+   sandbox stops the app or the tests (they need Chrome, a database, environment variables or secrets, the
+   network, more memory) that is reported as "not run", with the reason, not as a failure;
+   **monorepos**: every project a fix changed is built and checked; the first one whose app starts is the one
+   that is run for you;
 5. **rollback if needed**: if npm cannot resolve the tree, or the build or app breaks, the most recent
    package fix is undone (its card shows ↩ Rolled back with the log) and the rest is tried again
    (up to 3 times);
