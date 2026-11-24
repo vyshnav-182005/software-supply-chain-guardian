@@ -145,6 +145,8 @@ def _validate(scan_id: str, card_id: str, record: dict, step: Step) -> None:
     if applied["kind"] == "package":  # build/test the project that holds the (first) change
         build = build_and_test(dst / applied["project"], art)
     step("build_test", build["status"], build["detail"], mode=build.get("mode"), log=build.get("log"))
+    if (build.get("smoke") or {}).get("status") in ("passed", "failed", "env_error"):
+        step("app_smoke_test", build["smoke"]["status"], build["smoke"]["detail"], log=build.get("log"))
 
     # 5. rescan + 6. compare
     after = rescan(scan, dst, art)
@@ -156,20 +158,7 @@ def _validate(scan_id: str, card_id: str, record: dict, step: Step) -> None:
     if build["status"] == "failed" and build.get("log"):
         record["ai"] = explain_failure(art / build["log"], card)
 
-    fixed, new_risk = comparison["target_fixed"], comparison["new_high_risk"]
-    if not fixed or new_risk:
-        status = "not_fixed"
-        reason = "The target is still present after the change." if not fixed else \
-            f"New high/critical risk appeared: {', '.join(new_risk[:5])}"
-    elif build["status"] == "failed":
-        status, reason = "fixed_tests_failed", "The vulnerability is gone, but the build or tests failed."
-    elif build["status"] == "env_error":
-        status, reason = "fixed_untested", "The fix removes the risk and nothing new appeared, but the sandbox could not build/test it: " + build["detail"]
-    elif build["status"] in ("passed", "not_applicable"):
-        status, reason = "verified", "The fix removes the risk, nothing new appeared, and the build/tests passed." \
-            if build["status"] == "passed" else "The fix removes the risk and the rescan found nothing new."
-    else:
-        status, reason = "fixed_untested", "The fix removes the risk and nothing new appeared, but build/tests did not run: " + build["detail"]
+    status, reason = outcome(comparison["target_fixed"], comparison["new_high_risk"], build)
     record.update(status=status, reason=reason)
 
 
@@ -354,55 +343,109 @@ def node_image(project: Path) -> str:
     return f"node:{m.group(1) if m else '22'}-bookworm-slim"
 
 
+SMOKE_PORT = 3000
+# Runs inside the container: start the app, poll http://127.0.0.1:PORT/ for up to ~3 minutes, print the
+# HTTP status and the end of the app log, then exit (the container is removed, so the app stops).
+SMOKE_SCRIPT = (
+    "npm start > /tmp/app.log 2>&1 & "
+    "for i in $(seq 1 90); do sleep 2; "
+    "node -e \"require('http').get('http://127.0.0.1:'+process.env.PORT+'/',r=>{console.log('HTTP '+r.statusCode);"
+    "process.exit(r.statusCode<500?0:1)}).on('error',()=>process.exit(2))\" "
+    "&& { echo '--- app log ---'; tail -n 15 /tmp/app.log; exit 0; }; done; "
+    "echo 'App did not answer on port '$PORT; echo '--- app log ---'; tail -n 40 /tmp/app.log; exit 1"
+)
+
+
 def build_and_test(project: Path, art: Path) -> dict:
+    """install -> build -> app smoke test -> tests. Returns {status, detail, mode, log, smoke}."""
     scripts = json.loads((project / "package.json").read_text(encoding="utf-8")).get("scripts") or {}
     phases = [("install", ["npm", "ci", "--no-audit", "--no-fund", "--legacy-peer-deps"], True)]
-    # build may need the network (e.g. Angular inlines Google Fonts); tests run with the network off
+    # build may need the network (e.g. Angular inlines Google Fonts); the app and tests run with the network off
     phases += [(n, ["npm", "run", n], True) for n in ("build",) if n in scripts]
+    phases += [("smoke", ["sh", "-c", SMOKE_SCRIPT], False)] if "start" in scripts else []
     phases += [("test", ["npm", "test"], False)] if "test" in scripts else []
     log_name, log = "build-test.log", []
+    smoke = {"status": "not_applicable", "detail": "No start script, so there is no app to start"}
     if docker_ready():
         mode = "docker sandbox"
         image = node_image(project)
 
         def runner(cmd, network):
             return [DOCKER, "run", "--rm", "--cpus", "2", "--memory", "4g", "--pids-limit", "512",
-                    *([] if network else ["--network", "none"]), "-e", "CI=true", "-v", f"{project.resolve()}:/app",
-                    "-w", "/app", image, *cmd]
+                    *([] if network else ["--network", "none"]), "-e", "CI=true", "-e", f"PORT={SMOKE_PORT}",
+                    "-e", "NODE_ENV=production", "-v", f"{project.resolve()}:/app", "-w", "/app", image, *cmd]
     elif ALLOW_UNSANDBOXED:
         mode = "local, NOT sandboxed"
+        phases = [p for p in phases if p[0] != "smoke"]
+        smoke = {"status": "skipped", "detail": "The app is only started inside the Docker sandbox"}
 
         def runner(cmd, network):
             return [NPM if cmd[0] == "npm" else cmd[0], *cmd[1:]] + (["--ignore-scripts"] if cmd[1] == "ci" else [])
     else:
-        return {"status": "skipped", "mode": "none",
-                "detail": "Docker is not running, so the build and tests were not run (start Docker Desktop, or set "
-                          "GUARDIAN_ALLOW_UNSANDBOXED=1 to run them locally without a sandbox)."}
+        return {"status": "skipped", "mode": "none", "smoke": {"status": "skipped", "detail": "Docker is not running"},
+                "detail": "Docker is not running, so the build, app start and tests were not run (start Docker "
+                          "Desktop, or set GUARDIAN_ALLOW_UNSANDBOXED=1 to build and test locally without a sandbox)."}
     clean_env = {k: os.environ[k] for k in ("PATH", "SYSTEMROOT", "TEMP", "TMP", "COMSPEC", "PATHEXT") if k in os.environ}
     deadline = time.time() + TIMEOUT
     for name, cmd, network in phases:
         left = deadline - time.time()
         if left <= 0:
             (art / log_name).write_text("\n".join(log), encoding="utf-8")
-            return {"status": "failed", "mode": mode, "log": log_name, "detail": f"Timed out before '{name}'"}
+            return {"status": "failed", "mode": mode, "log": log_name, "smoke": smoke, "detail": f"Timed out before '{name}'"}
         try:
             out = subprocess.run(runner(cmd, network), cwd=project, capture_output=True, text=True, encoding="utf-8",
-                                 errors="replace", timeout=left, env={**clean_env, "CI": "true"})
-            log.append(f"$ {' '.join(cmd)}  [{name}, network {'on' if network else 'off'}]\n{out.stdout[-20000:]}\n{out.stderr[-20000:]}")
+                                 errors="replace", timeout=min(left, 300) if name == "smoke" else left,
+                                 env={**clean_env, "CI": "true"})
+            text = f"{out.stdout[-20000:]}\n{out.stderr[-20000:]}"
             code = out.returncode
         except subprocess.TimeoutExpired:
-            log.append(f"$ {' '.join(cmd)}\n(timed out)")
-            code = "timeout"
+            text, code = "(timed out)", "timeout"
+        shown = "npm start + GET /" if name == "smoke" else " ".join(cmd)
+        log.append(f"$ {shown}  [{name}, network {'on' if network else 'off'}]\n{text}")
         (art / log_name).write_text("\n".join(log), encoding="utf-8")
+        if name == "smoke":
+            m = re.search(r"HTTP (\d{3})", text)
+            excerpt = text.split("--- app log ---", 1)[-1].strip()[-1500:]
+            smoke = {"status": "passed" if code == 0 else "failed", "http_status": int(m.group(1)) if m else None,
+                     "url": f"http://127.0.0.1:{SMOKE_PORT}/", "log_excerpt": excerpt,
+                     "detail": f"App started and answered GET / with HTTP {m.group(1)}" if code == 0 and m else
+                               "The app did not start or did not answer on port 3000"}
+            if code != 0:
+                env = environment_problem(text)
+                smoke["status"] = "env_error" if env else "failed"
+                if env:
+                    smoke["detail"] = f"The app could not start in the sandbox: {env}"
+            continue  # tests still run, so their result is reported too
         if code != 0:
-            env = environment_problem(log[-1])
+            env = environment_problem(text)
             if env:  # the sandbox, not the fix, stopped it: report as not tested
-                return {"status": "env_error", "mode": mode, "log": log_name,
+                return {"status": "env_error", "mode": mode, "log": log_name, "smoke": smoke,
                         "detail": f"'{name}' could not run in the sandbox ({code}): {env}"}
-            return {"status": "failed", "mode": mode, "log": log_name, "detail": f"'{name}' failed ({code})"}
-    ran = ", ".join(n for n, _, _ in phases)
-    return {"status": "passed", "mode": mode, "log": log_name, "detail": f"Passed: {ran}" +
-            ("" if "test" in scripts else " (no test script)")}
+            return {"status": "failed", "mode": mode, "log": log_name, "smoke": smoke, "phase": name,
+                    "detail": f"'{name}' failed ({code})"}
+    ran = ", ".join(n for n, _, _ in phases if n != "smoke")
+    return {"status": "passed", "mode": mode, "log": log_name, "smoke": smoke,
+            "detail": f"Passed: {ran}" + ("" if "test" in scripts else " (no test script)")}
+
+
+def outcome(fixed: bool, new_risk: list, build: dict) -> tuple[str, str]:
+    """One rule for single and combined validation."""
+    smoke = build.get("smoke") or {}
+    app = f" App runs: GET / answered HTTP {smoke.get('http_status')}." if smoke.get("status") == "passed" else ""
+    if not fixed or new_risk:
+        return "not_fixed", ("The target is still present after the change." if not fixed else
+                             f"New high/critical risk appeared: {', '.join(new_risk[:5])}")
+    if build["status"] == "failed":
+        return "fixed_tests_failed", f"The risk is gone, but {build['detail']}.{app}"
+    if smoke.get("status") == "failed":
+        return "fixed_tests_failed", "The risk is gone and the build passed, but the app did not start."
+    if build["status"] == "passed":
+        return "verified", "The risk is gone, nothing new appeared, the build and tests passed." + app
+    if build["status"] == "not_applicable":
+        return "verified", "The risk is gone and the rescan found nothing new."
+    if smoke.get("status") == "passed":
+        return "fixed_app_runs", f"The risk is gone and nothing new appeared.{app} Tests did not run: {build['detail']}"
+    return "fixed_untested", "The risk is gone and nothing new appeared, but it was not built/tested: " + build["detail"]
 
 
 ENV_PATTERNS = [
@@ -411,6 +454,8 @@ ENV_PATTERNS = [
      "a service the tests need (database, server) is not running"),
     (re.compile(r"command not found|: not found|is not recognized as an internal or external command", re.I),
      "a required tool is missing in the sandbox image"),
+    (re.compile(r"ChromeHeadless|CHROME_BIN|No binary for Chrome|Cannot start Chrome|Failed to launch the browser", re.I),
+     "the tests need a browser (Chrome) that the sandbox image does not have"),
     (re.compile(r"ENOSPC|out of memory|JavaScript heap out of memory|Killed", re.I), "the sandbox ran out of resources"),
 ]
 
@@ -495,3 +540,183 @@ def explain_failure(log_path: Path, card: dict) -> dict:
             p.append("'explanation' must be 2-3 sentences")
         return p
     return llm.ask_batch("validate-failure", AI_SYSTEM, [{"subject": card["id"], "user": user, "validate": validate}])[card["id"]]
+
+
+# ---------------------------------------------------------------- combined: all approved fixes together
+
+COMBINED = "combined"
+
+
+def run_combined(scan_id: str) -> None:
+    """Apply every approved fix together on branch fix/combined, relock and build once, start the app,
+    run the tests, rescan, and explain every advisory that remains."""
+    record = {"card_id": COMBINED, "status": "queued", "steps": []}
+    with _lock:
+        if (scan_id, COMBINED) in CANCELLED:
+            CANCELLED.discard((scan_id, COMBINED))
+            return
+        record.update(status="running", started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        step = Step(scan_id, COMBINED, record)
+        try:
+            _combined(scan_id, record, step)
+        except Cancelled:
+            record.update(status="cancelled", reason="Stopped by user")
+        except Exception as e:
+            traceback.print_exc()
+            record.update(status="error", reason=f"{type(e).__name__}: {str(e)[:300]}")
+        CANCELLED.discard((scan_id, COMBINED))
+        record["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        db.save_validation(scan_id, COMBINED, record)
+
+
+def merge_changes(cards: list) -> list:
+    """All package.json changes of the approved cards; when two cards change the same package (a shared
+    parent such as express-jwt), the higher target wins. Lockfile-only updates are kept once each."""
+    from .agents.remediate import ver
+    best: dict = {}
+    for c in cards:
+        for ch in c.get("changes") or ([c["change"]] if c.get("change") else []):
+            field = "overrides" if c["action"] in ("override", "pin") else ch.get("field")
+            key = (ch["manifest"].replace("package-lock.json", "package.json"), field, ch["package"])
+            cur = best.get(key)
+            if cur is None or (ver(str(ch["to"])) or ver("0")) > (ver(str(cur["to"])) or ver("0")):
+                best[key] = {**ch, "field": field}
+    return list(best.values())
+
+
+def _combined(scan_id: str, record: dict, step: Step) -> None:
+    scan = db.get(scan_id)
+    res = scan["results"]
+    approved = {cid for cid, d in db.decisions(scan_id).items() if d["decision"] == "approved"}
+    cards = [c for c in res["remediate"]["cards"] if c["id"] in approved]
+    if not cards:
+        record.update(status="error", reason="No approved fixes to combine.")
+        return
+    src = db.DATA / "workspaces" / scan_id / "repo"
+    dst = db.DATA / "workspaces" / scan_id / "fix-combined"
+    art = db.DATA / "scans" / scan_id / "fix-combined"
+    _rmtree(dst)
+    _rmtree(art)
+    art.mkdir(parents=True)
+    shutil.copytree(src, dst, ignore=shutil.ignore_patterns("node_modules"))
+    _git(dst, "checkout", "-q", "-b", "fix/combined")
+    record.update(branch="fix/combined", workspace=dst.relative_to(db.DATA).as_posix(),
+                  card_title=f"All {len(cards)} approved fixes together")
+    step("copy", "done", f"Copied the scanned repo to {record['workspace']} on branch fix/combined")
+
+    pkg_cards = [c for c in cards if c["action"] in ("upgrade", "upgrade-parent", "upgrade-all", "relock", "override", "pin")]
+    cfg_cards = [c for c in cards if c["action"] == "config"]
+    manual = [c for c in cards if c not in pkg_cards and c not in cfg_cards]
+    applied_cards, details, diffs, skipped = [], [], [], []
+    package_apply = None
+    if pkg_cards:
+        merged = {"action": "upgrade-all", "package": "combined", "version": "", "changes": merge_changes(pkg_cards)}
+        package_apply = apply_change(merged, res, dst)
+        if package_apply["ok"]:
+            applied_cards += pkg_cards
+            details.append(package_apply["detail"])
+            diffs.append(package_apply.get("diff", ""))
+        else:
+            skipped += [(c, package_apply["detail"]) for c in pkg_cards]
+    for c in cfg_cards:
+        a = apply_config(c, res, dst)
+        if a["ok"]:
+            applied_cards.append(c)
+            details.append(a["detail"])
+            diffs.append(a["diff"])
+        else:
+            skipped.append((c, a["detail"]))
+    skipped += [(c, "needs a manual change (replace or remove)") for c in manual]
+    record["applied"] = [c["title"] for c in applied_cards]
+    record["not_applied"] = [{"fix": c["title"], "why": why} for c, why in skipped]
+    step("apply", "done" if applied_cards else "manual",
+         f"Applied {len(applied_cards)} of {len(cards)} approved fixes" + (f"; {len(skipped)} need a person" if skipped else ""),
+         diff="\n".join(d for d in diffs if d)[:6000])
+    if not applied_cards:
+        record.update(status="manual", reason="None of the approved fixes can be applied automatically.")
+        return
+
+    build = {"status": "not_applicable", "detail": "Only configuration changes: no package build to run"}
+    if package_apply and package_apply["ok"]:
+        ok, out = True, ""
+        for project in package_apply["projects"]:
+            ok_p, out_p = relock(dst / project, [p for proj, p in package_apply["updates"] if proj == project])
+            ok, out = ok and ok_p, out + out_p
+        (art / "relock.log").write_text(out, encoding="utf-8")
+        if not ok:
+            step("relock", "failed", "npm could not resolve the combined dependency tree", log="relock.log")
+            record.update(status="not_fixed", reason="npm could not resolve the dependency tree with all fixes together.")
+            return
+        step("relock", "done", "Regenerated package-lock.json once for all changes", log="relock.log")
+    _git(dst, *GIT_ID, "commit", "-q", "-am", f"Guardian: {len(applied_cards)} approved fixes combined")
+    if package_apply and package_apply["ok"]:
+        build = build_and_test(dst / package_apply["projects"][0], art)
+    step("build_test", build["status"], build["detail"], mode=build.get("mode"), log=build.get("log"))
+    if (build.get("smoke") or {}).get("status") in ("passed", "failed", "env_error"):
+        step("app_smoke_test", build["smoke"]["status"], build["smoke"]["detail"], log=build.get("log"))
+
+    after = rescan(scan, dst, art)
+    remaining = explain_remaining(scan, after, approved, applied_cards, skipped)
+    before_n = len(res["vulnerability"]["findings"])
+    after_adv = {(v["name"], v["version"], v["advisory_id"]) for v in after["vulnerabilities"]}
+    before_adv = {(v["name"], v["version"], v["advisory_id"]) for v in res["vulnerability"]["findings"]}
+    new_high = [f"{n}@{v} {a}" for n, v, a in after_adv - before_adv
+                if next((x for x in after["vulnerabilities"] if (x["name"], x["version"], x["advisory_id"]) == (n, v, a)), {})
+                .get("severity") in ("critical", "high")]
+    not_fixed = [c["title"] for c in applied_cards
+                 if any(v["advisory_id"] in c["advisories_removed"] and
+                        (v["name"], v["version"]) in {(p["package"], p["version"]) for p in c.get("packages") or []}
+                        for v in after["vulnerabilities"])]
+    sev = lambda vs: {s: sum(v["severity"] == s for v in vs) for s in ("critical", "high", "medium", "low", "unrated")}
+    comparison = {
+        "advisories_before": before_n, "advisories_after": len(after["vulnerabilities"]),
+        "severity_before": sev(res["vulnerability"]["findings"]), "severity_after": sev(after["vulnerabilities"]),
+        "packages_before": len(res["discovery"]["components"]), "packages_after": len(after["components"]),
+        "new_high_risk": new_high, "cards_not_fixed": not_fixed, "remaining": remaining,
+        "summary": f"Advisories {before_n} -> {len(after['vulnerabilities'])}; {len(new_high)} new high/critical",
+    }
+    step("rescan", "done", comparison["summary"])
+    record.update(comparison=comparison, build=build, after={k: after[k] for k in ("stats", "risk_counts")})
+    status, reason = outcome(not not_fixed, new_high, build)
+    if not_fixed:
+        reason = "Some fixes did not remove their target when combined: " + "; ".join(not_fixed[:3])
+    record.update(status=status, reason=reason)
+
+
+def explain_remaining(scan: dict, after: dict, approved: set, applied: list, skipped: list) -> list:
+    """Every advisory still reported after the combined fix, with the honest reason it is still there."""
+    res = scan["results"]
+    before = {(v["name"], v["version"], v["advisory_id"]): v for v in res["vulnerability"]["findings"]}
+    risks = {r["component"]: r for r in res.get("prioritize", {}).get("risks", [])}
+    card_by_pkg = {}
+    for c in res.get("remediate", {}).get("cards", []):
+        for p in c.get("packages") or [{"package": c["package"], "version": c["version"]}]:
+            card_by_pkg[(p["package"], p["version"])] = c
+    decisions = db.decisions(scan["id"])
+    applied_ids, skipped_ids = {c["id"] for c in applied}, {c["id"]: why for c, why in skipped}
+    out = []
+    for v in after["vulnerabilities"]:
+        key = (v["name"], v["version"], v["advisory_id"])
+        old = before.get(key)
+        card = card_by_pkg.get((v["name"], v["version"]))
+        risk = next((r for cid, r in risks.items() if cid.endswith(f"/{v['name']}@{v['version']}")), None)
+        if old is None:
+            why = "new: brought in by one of the upgrades"
+        elif not v.get("fixed_versions") and not v.get("fix"):
+            why = "no fixed version has been published"
+        elif card is None:
+            why = f"below the fix threshold (ranked {risk['band']} {risk['final_score']})" if risk else "not ranked"
+        elif card["id"] in skipped_ids:
+            why = skipped_ids[card["id"]]
+        elif decisions.get(card["id"], {}).get("decision") == "rejected":
+            why = "fix rejected"
+        elif card["id"] not in approved:
+            why = "fix not approved yet"
+        elif card["id"] in applied_ids:
+            why = "fix applied, but another route still pulls in this version"
+        else:
+            why = "not fixed"
+        out.append({"package": f"{v['name']}@{v['version']}", "id": v["advisory_id"], "severity": v["severity"],
+                    "reason": why})
+    order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    return sorted(out, key=lambda x: (order.get(x["severity"], 4), x["package"]))

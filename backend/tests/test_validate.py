@@ -99,4 +99,24 @@ if __name__ == "__main__":
     assert f["risk_bands_before"] == {"critical": 0, "high": 1, "medium": 1, "low": 1}
     assert f["risk_bands_after"] == {"critical": 0, "high": 1, "medium": 0, "low": 1}
     assert rep["summary"]["source"] == "rule" and "Supply-chain report" in report.markdown(rep)
+    # Combined: every approved fix together on fix/combined, remaining advisories explained
+    db.decide(sid, "c1", "approved", "reviewer", "")
+    after["vulnerabilities"] = [{"name": "marsdb", "version": "0.6.11", "advisory_id": "GHSA-m", "severity": "critical",
+                                 "fixed_versions": [], "fix": None}]
+    validate.run_combined(sid)
+    cv = db.validations(sid)["combined"]
+    assert cv["branch"] == "fix/combined" and len(cv["applied"]) == 2, cv
+    assert cv["comparison"]["advisories_before"] == 1 and cv["comparison"]["advisories_after"] == 1
+    assert cv["comparison"]["remaining"][0]["reason"] == "new: brought in by one of the upgrades"
+    assert cv["status"] == "not_fixed"                                    # a new critical appeared
+    comb = db.DATA / "workspaces" / sid / "fix-combined"
+    assert json.loads((comb / "package.json").read_text())["dependencies"]["mongodb"] == "^3.1.13"
+    assert (comb / "Dockerfile").read_text().startswith("FROM alpine@sha256:")
+    assert report.build(sid)["facts"]["combined"]["advisories_after"] == 1
+    from app.validate import merge_changes
+    m = merge_changes([{"action": "upgrade", "change": {"manifest": "package.json", "field": "dependencies",
+                                                        "package": "express-jwt", "to": "6.0.0"}},
+                       {"action": "upgrade-all", "changes": [{"manifest": "package.json", "field": "dependencies",
+                                                              "package": "express-jwt", "to": "8.4.1"}]}])
+    assert len(m) == 1 and m[0]["to"] == "8.4.1"                          # shared parent: highest target wins
     print("validate ok")
