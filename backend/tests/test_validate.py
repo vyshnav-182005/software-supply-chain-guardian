@@ -154,4 +154,16 @@ if __name__ == "__main__":
     fixed_app._undo(t, {"changes": pin["changes"]})
     assert json.loads((t / "package.json").read_text())["devDependencies"]["cypress"] == "^16.2.0"
     assert fixed_app.blamed_packages("npm error code EOVERRIDE\nnpm error Override for cypress@^16.2.0 conflicts") == ["cypress"]
+    # npm dry run: a fix npm cannot install is not applied on Approve and says why
+    sid3, _ = make_scan()
+    validate.relock = lambda project, update: (False, "npm error code ERESOLVE" + chr(10) + "npm error While resolving: mongodb@3.1.13")
+    r = validate.dry_run({"action": "upgrade-parent", "changes": [{"package": "mongodb", "to": "3.1.13", "spec_to": "^3.1.13",
+                          "spec_from": "^2.2.36", "field": "dependencies", "manifest": "package.json"}]},
+                         db.DATA / "workspaces" / sid3 / "repo")
+    assert not r["ok"] and r["blamed"] == ["mongodb"] and "While resolving" in r["reason"], r
+    fixed_app.apply_card(sid3, "c1")
+    v3 = db.validations(sid3)["c1"]
+    assert v3["status"] == "conflicts" and "While resolving" in v3["reason"], v3
+    assert json.loads((fixed_app.workdir(sid3) / "package.json").read_text())["dependencies"]["mongodb"] == "^2.2.36"
+    validate.relock = lambda project, update: (True, "ok")
     print("validate ok")

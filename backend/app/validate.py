@@ -593,3 +593,53 @@ def explain_remaining(scan: dict, after: dict, approved: set, applied: list, ski
                     "reason": why})
     order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     return sorted(out, key=lambda x: (order.get(x["severity"], 4), x["package"]))
+
+
+# ---------------------------------------------------------------- npm dry run (compatibility check)
+
+def dry_run(card: dict, src_root: Path) -> dict:
+    """Would npm accept this fix? Copies only the manifests of the projects the card touches (package.json,
+    package-lock.json, .npmrc) from src_root into a temporary folder, applies the card there and lets npm
+    resolve the tree (--package-lock-only --ignore-scripts: nothing downloaded into node_modules, no scripts).
+    Returns {"ok": bool, "reason": str, "blamed": [package names], "log": str}."""
+    import copy
+    import tempfile
+    changes = card.get("changes") or ([card["change"]] if card.get("change") else [])
+    projects = sorted({Path(ch["manifest"].replace("package-lock.json", "package.json")).parent.as_posix() for ch in changes})
+    if not projects or card["action"] not in ("upgrade", "upgrade-parent", "upgrade-all", "relock", "override", "pin"):
+        return {"ok": True, "reason": "no package change", "blamed": [], "log": ""}
+    tmp = Path(tempfile.mkdtemp(prefix="guardian-dry-"))
+    try:
+        for proj in projects:
+            (tmp / proj).mkdir(parents=True, exist_ok=True)
+            for name in ("package.json", "package-lock.json", ".npmrc"):
+                if (src_root / proj / name).is_file():
+                    shutil.copy(src_root / proj / name, tmp / proj / name)
+        applied = apply_change(copy.deepcopy(card), {}, tmp)
+        if not applied["ok"]:
+            return {"ok": False, "reason": applied["detail"], "blamed": [], "log": ""}
+        log, ok = "", True
+        for proj in applied["projects"]:
+            ok_p, out = relock(tmp / proj, [n for p, n in applied["updates"] if p == proj])
+            ok, log = ok and ok_p, log + out
+        if ok:
+            return {"ok": True, "reason": "npm resolves the dependency tree with this fix", "blamed": [], "log": ""}
+        errors = [l.strip() for l in log.splitlines() if "npm error" in l and "A complete log" not in l]
+        blamed = []
+        for rx in NPM_BLAME:
+            for n in rx.findall("\n".join(errors)):
+                if n not in blamed:
+                    blamed.append(n)
+        return {"ok": False, "blamed": blamed, "log": log[-4000:],
+                "reason": "; ".join(e.removeprefix("npm error").strip() for e in errors[:3]) or "npm could not resolve"}
+    finally:
+        _rmtree(tmp)
+
+
+NPM_BLAME = [  # npm error lines that name the package at fault
+    re.compile(r"Override for (@?[^@\s]+)@"),                  # EOVERRIDE: override clashes with a direct dependency
+    re.compile(r"While resolving: (@?[^@\s]+)@"),              # ERESOLVE
+    re.compile(r"Conflicting peer dependency: (@?[^@\s]+)@"),
+    re.compile(r"Found: (@?[^@\s]+)@"),
+    re.compile(r"No matching version found for (@?[^@\s]+)@"),  # ETARGET
+]

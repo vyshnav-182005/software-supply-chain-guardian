@@ -24,8 +24,8 @@ from pathlib import Path
 
 from . import db
 from .agents.remediate import ver
-from .validate import (DOCKER, GIT_ID, SMOKE_PORT, Step, _git, _rmtree, apply_change, apply_config, build_and_test,
-                       docker_ready, explain_remaining, node_image, relock, rescan)
+from .validate import (DOCKER, GIT_ID, NPM_BLAME, SMOKE_PORT, Step, _git, _rmtree, apply_change, apply_config,
+                       build_and_test, docker_ready, dry_run, explain_remaining, node_image, relock, rescan)
 
 FIXED = "fixed"           # validations-table key for the build/run record
 APP_PORT = 3001           # where the fixed app is published on the host
@@ -91,6 +91,16 @@ def apply_card(scan_id: str, card_id: str) -> None:
                 card2, skipped = without_downgrades(card, root)
                 if not card2["changes"]:
                     rec.update(status="already_applied", reason="; ".join(skipped) or "Nothing to change")
+                    return
+                db.save_validation(scan_id, card_id, {**rec, "status": "checking", "reason": "npm dry run on the fixed copy"})
+                check = dry_run(card2, root)  # with every fix applied so far: would npm accept this one too?
+                if not check["ok"]:
+                    vals = db.validations(scan_id)
+                    culprits = [c["title"] for c in res["remediate"]["cards"] if vals.get(c["id"], {}).get("status") == "applied"
+                                and any(ch.get("package") in check["blamed"] for ch in vals[c["id"]].get("changes") or [])]
+                    rec.update(status="conflicts", reason=(f"Conflicts with {', '.join(culprits)}: " if culprits else
+                                                           "npm cannot install it: ") + check["reason"],
+                               npm_log=check["log"], blamed=check["blamed"])
                     return
                 applied = apply_change(card2, res, root)
             elif card["action"] == "config":
@@ -166,16 +176,6 @@ def _commit_tracked(root: Path, message: str, extra: list[str] = ()) -> None:
         _git(root, "add", "-f", "--", *extra)
     if _git(root, "status", "--porcelain", "--untracked-files=no").strip():
         _git(root, *GIT_ID, "commit", "-q", "-m", message)
-
-
-NPM_BLAME = [  # npm error lines that name the package at fault
-    re.compile(r"Override for (@?[^@\s]+)@"),                 # EOVERRIDE: override clashes with a direct dependency
-    re.compile(r"While resolving: (@?[^@\s]+)@"),             # ERESOLVE
-    re.compile(r"Could not resolve dependency:\s*\n?.*?peer (@?[^@\s]+)@"),
-    re.compile(r"Conflicting peer dependency: (@?[^@\s]+)@"),
-    re.compile(r"Found: (@?[^@\s]+)@"),
-    re.compile(r"No matching version found for (@?[^@\s]+)@"),  # ETARGET
-]
 
 
 def blamed_packages(log: str) -> list[str]:
