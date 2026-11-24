@@ -371,10 +371,13 @@ def run(state: dict) -> tuple[dict, dict]:
                              "plain": {"source": "rule", "text": f"{r['package']} {r['version']} is known malware. "
                                        "Removing it stops it from running on your machines; anything that "
                                        "depends on it must be replaced."}})
+    conflicts = check_compatibility(cards, root)
     public = {
         "cards": cards, "errors": errors, "llm": {**llm.status(), "answered": sum(bool(c["ai"].get("ok")) for c in cards)},
+        "conflicts": conflicts,
         "_status": "partial" if errors else "done",
-        "_summary": f"{len(cards)} fix cards for {len(top)} top risks"
+        "_summary": f"{len(cards)} fix cards for {len(top)} risks"
+                    + (f"; {conflicts} conflict with the project's dependencies" if conflicts else "")
                     + (f"; {len(errors)} could not be planned" if errors else ""),
     }
     return {"fixes": cards}, public
@@ -452,6 +455,28 @@ def pin_card(r: dict, paths: dict, root: Path) -> dict:
                   "patch, so this pins it to the exact version that was checked, so a new, unreviewed release "
                   "cannot slip in, and flags it for a security review. The risk is frozen, not removed."},
     }
+
+
+DRY_RUN = os.environ.get("GUARDIAN_FIX_DRYRUN", "on").lower() not in ("0", "off", "false", "no")
+
+
+def check_compatibility(cards: list, root: Path) -> int:
+    """npm dry run of every package fix on its own against the scanned project (4 at a time). A card npm
+    cannot install is marked with npm's reason, and Approve is blocked for it."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from ..validate import dry_run
+    todo = [c for c in cards if c["action"] in ("upgrade", "upgrade-parent", "upgrade-all", "relock", "override", "pin")]
+    if not DRY_RUN or not todo:
+        return 0
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda c: dry_run(c, root), todo))
+    for c, r in zip(todo, results):
+        c["compat"] = {"ok": r["ok"], "reason": r["reason"], "blamed": r["blamed"]}
+        if not r["ok"]:
+            c["plain"] = {"source": "rule", "text": "npm cannot install this fix with the project's other dependencies, "
+                                                    f"so it cannot be approved: {r['reason']}"}
+    return sum(not r["ok"] for r in results)
 
 
 def plain_explanation(card: dict) -> dict:

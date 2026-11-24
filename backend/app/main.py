@@ -60,9 +60,12 @@ def decide(scan_id: str, d: Decision, bg: BackgroundTasks):
     scan = db.get(scan_id)
     if not scan:
         raise HTTPException(404, "Scan not found")
-    cards = {c["id"] for c in scan["results"].get("remediate", {}).get("cards", [])}
+    cards = {c["id"]: c for c in scan["results"].get("remediate", {}).get("cards", [])}
     if d.card_id not in cards:
         raise HTTPException(404, "Fix card not found in this scan")
+    if d.decision == "approved" and (cards[d.card_id].get("compat") or {}).get("ok") is False:
+        raise HTTPException(409, "npm cannot install this fix with the project's dependencies: "
+                                 + cards[d.card_id]["compat"]["reason"])
     row = db.decide(scan_id, d.card_id, d.decision, d.decided_by.strip() or "reviewer", d.note.strip())
     if d.decision == "approved":  # Approve applies the fix to the scan's fixed copy of the app
         db.save_validation(scan_id, d.card_id, {"card_id": d.card_id, "status": "applying", "steps": []})
@@ -88,7 +91,7 @@ def build_fixed(scan_id: str, bg: BackgroundTasks):
     vals = db.validations(scan_id)
     if not any(v.get("status") == "applied" for v in vals.values()):
         raise HTTPException(409, "Approve at least one fix first (it must show 'Applied')")
-    if vals.get(fixed_app.FIXED, {}).get("status") in ("queued", "running") or             any(v.get("status") == "applying" for v in vals.values()):
+    if vals.get(fixed_app.FIXED, {}).get("status") in ("queued", "running") or             any(v.get("status") in ("applying", "checking") for v in vals.values()):
         raise HTTPException(409, "Still busy: wait for the current step to finish")
     db.save_validation(scan_id, fixed_app.FIXED, {"card_id": fixed_app.FIXED, "status": "queued", "steps": []})
     bg.add_task(fixed_app.build, scan_id)

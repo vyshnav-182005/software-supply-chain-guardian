@@ -100,7 +100,12 @@ def build(scan_id: str) -> dict:
                              "severity_before": cmp_["severity_before"], "severity_after": cmp_["severity_after"],
                              "app_runs": smoke.get("status") == "passed", "app_http_status": smoke.get("http_status"),
                              "build": (combined.get("build") or {}).get("status"), "remaining_by_reason": reasons}
+    incompatible = [{"fix": c["title"], "why": (c.get("compat") or {}).get("reason") or validations.get(c["id"], {}).get("reason")}
+                    for c in cards if (c.get("compat") or {}).get("ok") is False
+                    or validations.get(c["id"], {}).get("status") == "conflicts"]
+    facts["skipped_incompatible"] = len(incompatible)
     report = {"facts": facts, "remaining": remaining, "audit_trail": trail, "combined": combined,
+              "skipped_incompatible": incompatible,
               "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     report["summary"] = summarize(facts)
     return report
@@ -149,6 +154,10 @@ def markdown(rep: dict) -> str:
                 f"- Decision: {d['decision']} by {d['by']} at {d['at']}" if d else "- Decision: awaiting",
                 f"- Validation: {v['status']} - {v['reason']} (build/test: {v['build']}, {v['build_mode']}; rescan: {v['rescan']})"
                 if v else "- Validation: not run", ""]
+    if rep.get("skipped_incompatible"):
+        out += ["## Fixes skipped as incompatible", ""]
+        out += [f"- {x['fix']}: {x['why']}" for x in rep["skipped_incompatible"]]
+        out.append("")
     c = rep.get("combined")
     if c and c.get("comparison"):
         cf = f["combined"]
