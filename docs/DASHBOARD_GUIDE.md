@@ -472,7 +472,7 @@ Every approved fix is already applied to one copy of the project. **Build, run &
    with `uv` that the edited requirements still resolve;
 2. **build**: on this laptop by default (`GUARDIAN_RUNNER=local`), or in Docker (`GUARDIAN_RUNNER=docker`).
    Node: `npm ci` (reusing the npm cache) and `npm run build`. Python: a virtual environment next to the copy
-   (`workspaces<scan>envs`, made with uv, never inside the repo) and the requirements installed into it. Locally the project's own code
+   (`workspaces/<scan>/venvs`, made with uv, never inside the repo) and the requirements installed into it. Locally the project's own code
    runs without a sandbox: use it for repos you trust;
 3. **app check**: starts the app inside the sandbox (network off) and requests `GET /`. The start command is
    detected: Node `npm start` (port 3000); Python, in this order, the Procfile `web:` line, Django
