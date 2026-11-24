@@ -19,6 +19,7 @@ The pipeline never depends on the LLM to finish.
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -99,11 +100,40 @@ def _key(task: str, subject: str, system: str, user: str) -> str:
     return f"{task}|{MODEL}|{subject}|{hashlib.sha1((system + user).encode()).hexdigest()[:16]}"
 
 
+def _call(system: str, prompt: str) -> tuple[str, dict]:
+    """One API call. On a rate limit (HTTP 429) wait as long as the API asks (max 60 s) and try once more."""
+    for attempt in (1, 2):
+        try:
+            return _chat(system, prompt)
+        except Exception as e:
+            msg = str(e)
+            if attempt == 1 and ("429" in msg or "rate limit" in msg.lower()):
+                m = re.search(r"try again in ([\d.]+)\s*s", msg)
+                time.sleep(min(60.0, float(m.group(1)) + 1 if m else 20.0))
+                continue
+            raise
+
+
+def _answers(raw: str, items: list) -> dict:
+    """answers by item id; ids compared loosely, and a single answer for a single item always matches."""
+    data = json.loads(raw)
+    answers = data.get("answers") if isinstance(data, dict) else None
+    if answers is None and isinstance(data, dict) and len(items) == 1 and "id" not in data:
+        answers = [data]  # the model answered one item without the wrapper
+    answers = [a for a in answers or [] if isinstance(a, dict)]
+    if len(items) == 1 and len(answers) == 1:
+        return {items[0]["subject"]: answers[0]}
+    norm = lambda x: re.sub(r"\s+", "", str(x)).lower()
+    by = {norm(a.get("id")): a for a in answers}
+    return {r["subject"]: by[norm(r["subject"])] for r in items if norm(r["subject"]) in by}
+
+
 def ask_batch(task: str, system: str, requests: list[dict]) -> dict[str, dict]:
-    """Like ask(), for many items at once: BATCH items per API call, cache per item, and one retry
-    call per batch that re-sends only the items whose answers failed the Validator.
+    """Like ask(), for many items at once: BATCH items per API call, cache per item. Items whose answer
+    is missing or fails the Validator are asked again one at a time (with the problems listed), so one
+    confusing item cannot spoil the others.
     requests: [{"subject": unique id, "user": prompt text, "validate": fn(answer) -> problems}]
-    returns {subject: result}. Calls per run = ceil(uncached / BATCH) + at most one retry each."""
+    returns {subject: result}."""
     out, pending = {}, []
     for r in requests:
         cached = db.cache_get(_key(task, r["subject"], system, r["user"]))
@@ -113,46 +143,48 @@ def ask_batch(task: str, system: str, requests: list[dict]) -> dict[str, dict]:
             out[r["subject"]] = {"ok": False, "reason": "AI explanation unavailable: no API key configured"}
         else:
             pending.append(r)
+
+    def ask_group(items: list, attempt: int, problems: dict) -> list:
+        """One call for `items`; stores the valid answers, returns the items that still need an answer."""
+        prompt = "\n\n".join(
+            f"ITEM id={r['subject']}\n{r['user']}"
+            + (("\nYour previous answer for this item was rejected by the validator:\n- "
+                + "\n- ".join(problems[r["subject"]]) + "\nFix these problems.") if r["subject"] in problems else "")
+            for r in items)
+        try:
+            raw, usage = _call(system + BATCH_RULES, prompt)
+            by_id = _answers(raw, items)
+        except json.JSONDecodeError:
+            by_id, usage = {}, {}
+        except Exception as e:
+            if "json" in str(e).lower():  # the API rejected malformed JSON: a failed answer, not an outage
+                by_id, usage = {}, {}
+            else:  # network, auth, still rate-limited: keep the rule results
+                for r in items:
+                    out[r["subject"]] = {"ok": False, "reason": f"AI explanation unavailable: {type(e).__name__}: {str(e)[:200]}"}
+                return []
+        share, failed = sum(usage.values()) // max(1, len(items)), []
+        for r in items:
+            a = by_id.get(r["subject"])
+            p = ["no answer was given for this item"] if a is None else r["validate"](a)
+            if p:
+                problems[r["subject"]] = p
+                failed.append(r)
+                continue
+            result = {"ok": True, "answer": {k: v for k, v in a.items() if k != "id"}, "model": MODEL,
+                      "attempts": attempt, "tokens": share, "batch_size": len(items),
+                      "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            db.cache_put(_key(task, r["subject"], system, r["user"]), result)
+            out[r["subject"]] = result
+        return failed
+
     for start in range(0, len(pending), BATCH):
-        todo, problems, calls = pending[start:start + BATCH], {}, 0
-        for attempt in (1, 2):
-            prompt = "\n\n".join(
-                f"ITEM id={r['subject']}\n{r['user']}"
-                + (("\nYour previous answer for this item was rejected by the validator:\n- "
-                    + "\n- ".join(problems[r["subject"]]) + "\nFix these problems.") if r["subject"] in problems else "")
-                for r in todo)
-            try:
-                raw, usage = _chat(system + BATCH_RULES, prompt)
-                calls += 1
-                answers = json.loads(raw).get("answers")
-                by_id = {str(a.get("id")): a for a in answers if isinstance(a, dict)} if isinstance(answers, list) else {}
-            except Exception as e:
-                if "json" not in str(e).lower():  # network, auth, rate limit: keep the rule results
-                    for r in todo:
-                        out[r["subject"]] = {"ok": False, "reason": f"AI explanation unavailable: {type(e).__name__}: {str(e)[:200]}"}
-                    todo = []
-                    break
-                by_id, usage = {}, {}  # model returned invalid JSON: counts as a failed answer
-            share = sum(usage.values()) // max(1, len(todo))
-            failed = []
-            for r in todo:
-                a = by_id.get(r["subject"])
-                p = ["no answer was given for this item"] if a is None else r["validate"](a)
-                if p:
-                    problems[r["subject"]] = p
-                    failed.append(r)
-                    continue
-                a = {k: v for k, v in a.items() if k != "id"}
-                result = {"ok": True, "answer": a, "model": MODEL, "attempts": attempt, "tokens": share,
-                          "batch_size": len(todo), "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-                db.cache_put(_key(task, r["subject"], system, r["user"]), result)
-                out[r["subject"]] = result
-            todo = failed
-            if not todo:
-                break
-        for r in todo:
-            out[r["subject"]] = {"ok": False, "reason": "needs human review: AI answer failed validation twice",
-                                 "problems": problems.get(r["subject"], [])}
+        problems: dict = {}
+        failed = ask_group(pending[start:start + BATCH], 1, problems)
+        for r in failed:  # second chance, alone
+            if ask_group([r], 2, problems):
+                out[r["subject"]] = {"ok": False, "reason": "needs human review: AI answer failed validation twice",
+                                     "problems": problems.get(r["subject"], [])}
     return out
 
 
