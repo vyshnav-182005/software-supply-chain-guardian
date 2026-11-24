@@ -111,7 +111,9 @@ def manifest_spec(root: Path, project_path: str, name: str) -> tuple[str | None,
 _releases: dict[str, list] = {}
 
 
-def changelog(name: str, frm: Version, to: Version) -> tuple[str, str]:
+def changelog(name: str, frm: Version | None, to: Version | None) -> tuple[str, str]:
+    if frm is None or to is None:  # e.g. a lockfile fix whose target is "removed", or an unusual version string
+        return "", "no version range to compare"
     repo = (packument(name).get("repository") or {})
     url = repo.get("url", "") if isinstance(repo, dict) else str(repo)
     m = re.search(r"github\.com[/:]([^/]+)/([^/#.]+)", url)
@@ -238,7 +240,7 @@ def plan_fix(r: dict, comps: dict, paths: dict, root: Path, edges: list | None =
     changes, steps_all, t_afters, rejected, missing = [], [], [], [], []
     for (proj, ids), chain in zip(routes, chains):
         project_path = proj.removeprefix("project:")
-        D, d_current = chain[0], ver(comps[ids[0]]["version"])
+        D, d_current = chain[0], ver(comps[ids[0]]["version"]) or Version("0.0.0")
         spec_from, field, manifest = manifest_spec(root, project_path, D)
         cand, t_new, steps, rej = find_safe(chain, d_current, need)
         rejected += rej
@@ -332,7 +334,10 @@ def run(state: dict) -> tuple[dict, dict]:
     for card in cards:
         ch = card.get("change")
         if ch and card["action"] != "replace":
-            notes, source = changelog(ch["package"], ver(ch["from"]), ver(ch["to"]))
+            try:  # one odd version or a registry hiccup must not fail the whole scan
+                notes, source = changelog(ch["package"], ver(str(ch["from"])), ver(str(ch["to"])))
+            except Exception as e:
+                notes, source = "", f"changelog unavailable ({type(e).__name__})"
             card["evidence"]["changelog"] = source
             snippets = find_usages(root, [ch["package"]])
             card["usage_snippets"] = snippets
@@ -481,7 +486,7 @@ def merge_same_change(cards: list) -> list:
         key = ("upgrade", ch["package"]) if ch and upgrade else (c["action"], ch["package"], ch["to"]) if ch else None
         if key and key in seen:
             first = seen[key]
-            if upgrade and ver(ch["to"]) > ver(first["change"]["to"]):
+            if upgrade and (ver(str(ch["to"])) or Version("0.0.0")) > (ver(str(first["change"]["to"])) or Version("0.0.0")):
                 for k in ("change", "changes", "routes", "vetting", "patch", "resolution", "target_after", "title",
                           "evidence", "usage_snippets", "ai",
                           "compatibility", "plain"):
