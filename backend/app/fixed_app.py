@@ -25,7 +25,7 @@ from pathlib import Path
 from . import db
 from .agents.remediate import ver
 from .validate import (APP_PORT, DOCKER, GIT_ID, LOCAL_APPS, NPM_BLAME, Step, _git, _rmtree, apply_change,
-                       apply_config, runner_kind, stop_local,
+                       apply_config, remove_stray_venvs, runner_kind, stop_local,
                        build_and_test, detect_app, docker_ready, dry_run, explain_remaining, relock, rescan)
 
 FIXED = "fixed"           # validations-table key for the build/run record
@@ -92,14 +92,14 @@ def apply_card(scan_id: str, card_id: str) -> None:
                 if not card2["changes"]:
                     rec.update(status="already_applied", reason="; ".join(skipped) or "Nothing to change")
                     return
-                db.save_validation(scan_id, card_id, {**rec, "status": "checking", "reason": "npm dry run on the fixed copy"})
+                db.save_validation(scan_id, card_id, {**rec, "status": "checking", "reason": "dry run on the fixed copy"})
                 check = dry_run(card2, root)  # with every fix applied so far: would npm accept this one too?
                 if not check["ok"]:
                     vals = db.validations(scan_id)
                     culprits = [c["title"] for c in res["remediate"]["cards"] if vals.get(c["id"], {}).get("status") == "applied"
                                 and any(ch.get("package") in check["blamed"] for ch in vals[c["id"]].get("changes") or [])]
                     rec.update(status="conflicts", reason=(f"Conflicts with {', '.join(culprits)}: " if culprits else
-                                                           "npm cannot install it: ") + check["reason"],
+                                                           f"{check.get('tool', 'npm')} cannot install it: ") + check["reason"],
                                npm_log=check["log"], blamed=check["blamed"])
                     return
                 applied = apply_change(card2, res, root)
@@ -217,6 +217,7 @@ def _build(scan_id: str, rec: dict, step: Step) -> None:
     res = scan["results"]
     cards = res["remediate"]["cards"]
     root = ensure_copy(scan_id)
+    remove_stray_venvs(root)
     art = db.DATA / "scans" / scan_id / "fixed"
     art.mkdir(parents=True, exist_ok=True)
     stop_app(scan_id)
@@ -243,19 +244,19 @@ def _build(scan_id: str, rec: dict, step: Step) -> None:
         (art / "relock.log").write_text(out, encoding="utf-8")
         if not ok:
             if not pkg or attempt == MAX_ROLLBACKS:
-                step("relock", "failed", "npm could not resolve the dependency tree: " +
+                step("relock", "failed", "The dependency tree could not be resolved (npm/uv): " +
                      (", ".join(blamed_packages(out)) or "see the log"), log="relock.log")
-                rec.update(status="failed", reason="npm could not resolve the dependency tree, even without the package "
+                rec.update(status="failed", reason="The dependency tree could not be resolved, even without the package "
                                                    "fixes (see relock.log).")
                 return
             if attempt == MAX_ROLLBACKS - 1:  # last resort: undo every package fix so the app runs again
                 for c, v in reversed(pkg):
-                    _rollback(scan_id, root, c, v, "npm could not resolve the package fixes together; all package "
+                    _rollback(scan_id, root, c, v, "the package fixes could not be resolved together; all package "
                               "fixes were rolled back so the app runs", out[-4000:], rec, step)
                 continue
             c, v = _culprit(pkg, out)
             blamed = blamed_packages(out)
-            _rollback(scan_id, root, c, v, "npm could not resolve the dependency tree with this fix"
+            _rollback(scan_id, root, c, v, "the dependency tree could not be resolved with this fix"
                       + (f" (npm named {', '.join(blamed[:3])})" if blamed else ""), out[-4000:], rec, step)
             continue
         _commit_tracked(root, "Guardian: regenerate lockfiles",

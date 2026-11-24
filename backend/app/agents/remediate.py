@@ -536,7 +536,8 @@ def check_compatibility(cards: list, root: Path) -> int:
     for c, r in zip(todo, results):
         c["compat"] = {"ok": r["ok"], "reason": r["reason"], "blamed": r["blamed"]}
         if not r["ok"]:
-            c["plain"] = {"source": "rule", "text": "npm cannot install this fix with the project's other dependencies, "
+            c["plain"] = {"source": "rule", "text": f"{r.get('tool', 'npm')} cannot install this fix with the project's "
+                                                    "other dependencies, "
                                                     f"so it cannot be approved: {r['reason']}"}
     return sum(not r["ok"] for r in results)
 

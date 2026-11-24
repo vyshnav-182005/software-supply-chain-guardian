@@ -18,6 +18,7 @@ Starts in the background when a fix card is approved. The scanned clone is never
 
 Result: verified | fixed_untested | fixed_tests_failed | not_fixed (with the reason).
 """
+import hashlib
 import json
 import os
 import re
@@ -171,9 +172,17 @@ def _validate(scan_id: str, card_id: str, record: dict, step: Step) -> None:
 
 
 def _rmtree(path: Path) -> None:
-    def force(func, p, _exc):  # git pack files are read-only on Windows
-        os.chmod(p, stat.S_IWRITE)
-        func(p)
+    def force(func, p, _exc):
+        if not os.path.lexists(p):  # already gone (removed below as a link)
+            return
+        try:  # git pack files are read-only on Windows
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except OSError:  # a Linux symlink (e.g. lib64 in a venv made in Docker) that Windows cannot open
+            try:
+                os.unlink(p)
+            except OSError:
+                os.rmdir(p)
     if path.exists():
         shutil.rmtree(path, onerror=force)
 
@@ -383,7 +392,7 @@ def node_image(project: Path) -> str:
 
 
 SMOKE_PORT = 3000
-VENV = "/app/.guardian-venv"
+VENV = "/venv"  # Docker: the venv folder outside the repo (see venv_dir) is mounted here
 PY_PATH = f"{VENV}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # Runs inside the container: start the app, poll http://127.0.0.1:PORT/ for up to ~3 minutes, print the
 # HTTP status and the end of the app log, then exit (the container is removed, so the app stops).
@@ -434,10 +443,14 @@ def dockerfile_start(project: Path) -> tuple[str | None, int | None]:
 def _py_app(project: Path, pattern: str) -> str | None:
     """'module:variable' of the first top-level-ish .py file that creates the app (FastAPI(...) / Flask(...))."""
     rx = re.compile(rf"^(\w+)\s*=\s*{pattern}\(", re.M)
-    files = sorted(project.glob("*.py")) + sorted(project.glob("*/*.py")) + sorted(project.glob("*/*/*.py"))
-    for f in files:
-        if any(part.startswith(".") or part in ("tests", "test", "venv") for part in f.relative_to(project).parts):
-            continue
+    files = []
+    for dirpath, dirnames, filenames in os.walk(project):  # os.walk never follows links
+        depth = len(Path(dirpath).relative_to(project).parts)
+        dirnames[:] = [] if depth >= 2 else sorted(
+            d for d in dirnames if not d.startswith(".") and d not in ("tests", "test", "venv", "env", "node_modules",
+                                                                       "site-packages", "__pycache__"))
+        files += [Path(dirpath) / f for f in sorted(filenames) if f.endswith(".py")]
+    for f in sorted(files, key=lambda f: (len(f.relative_to(project).parts), str(f))):
         m = rx.search(_read(f))
         if m:
             return ".".join(f.relative_to(project).with_suffix("").parts) + ":" + m.group(1)
@@ -496,13 +509,33 @@ def detect_app(project: Path) -> dict:
             "why": None if start else "No Procfile, manage.py, FastAPI/Flask app or Dockerfile CMD found to start"}
 
 
+def venv_dir(project: Path, kind: str = "local") -> Path:
+    """Where a project's virtual environment lives: OUTSIDE the repo copy (workspaces/<scan>/venvs/...), so no
+    scan, copy or git command ever walks into it (a Linux venv has symlinks Windows cannot open)."""
+    p = project.resolve()
+    parts = p.parts
+    i = next((n for n, x in enumerate(parts) if x == "workspaces"), None)
+    home = Path(*parts[:i + 2]) / "venvs" if i is not None and len(parts) > i + 1 else db.DATA / "venvs"
+    return home / f"{kind}-{hashlib.sha1(str(p).encode()).hexdigest()[:12]}"
+
+
+def remove_stray_venvs(root: Path) -> None:
+    """Older versions put .guardian-venv inside the copy: remove it (without following its links)."""
+    for dirpath, dirnames, _ in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in ("node_modules", ".git")]
+        if ".guardian-venv" in dirnames:
+            _rmtree(Path(dirpath) / ".guardian-venv")
+            dirnames.remove(".guardian-venv")
+
+
 def _uv_install(pyver: str, pip_args: list[str], uvicorn: bool) -> list[list[str]] | None:
-    """Local runner: a fresh virtual environment in the project (.guardian-venv), filled by uv (fast, cached)."""
+    """Local runner: a virtual environment outside the repo (venv_dir), filled by uv (fast, cached).
+    "{venv}" is replaced with that folder when the commands run."""
     from .agents.pydeps import UV
     if not UV:
         return None
-    pip = [UV, "pip", "install", "-q", "--python", ".guardian-venv"]
-    return [[UV, "venv", "-q", "--allow-existing", "--python", pyver, ".guardian-venv"], [*pip, *pip_args],
+    pip = [UV, "pip", "install", "-q", "--python", "{venv}"]
+    return [[UV, "venv", "-q", "--allow-existing", "--python", pyver, "{venv}"], [*pip, *pip_args],
             *([[*pip, "uvicorn"]] if uvicorn else [])]
 
 
@@ -511,7 +544,7 @@ def local_env(project: Path, plan: dict, ci: str, port: int) -> dict:
     env = {k: v for k, v in os.environ.items() if not re.search(r"KEY|TOKEN|SECRET|PASSWORD", k, re.I)}
     env.update(CI=ci, PORT=str(port), BROWSER="none", PYTHONDONTWRITEBYTECODE="1")
     if plan["runtime"] == "python":
-        venv = project / ".guardian-venv"
+        venv = venv_dir(project)
         env.update(VIRTUAL_ENV=str(venv), PATH=f"{venv / ('Scripts' if os.name == 'nt' else 'bin')}{os.pathsep}{env.get('PATH', '')}")
     return env
 
@@ -581,10 +614,13 @@ def _local_build_and_test(project: Path, art: Path, log_name: str, plan: dict) -
         return {"status": "skipped", "mode": mode, "smoke": {"status": "skipped", "detail": "uv is not installed"},
                 "detail": "uv is not installed, so the Python app was not installed or run (install uv)"}
     py = plan["runtime"] == "python"
-    venv_py = str(project / ".guardian-venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
+    venv = venv_dir(project)
+    venv_py = str(venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
     local = lambda cmd: [NPM if cmd[0] == "npm" else venv_py if py and cmd[0] == "python" else cmd[0], *cmd[1:]]
     port = APP_PORT if plan["runtime"] == "node" or "PORT" in (plan["start"] or "") else plan["port"]
-    phases = [("install", c) for c in plan["local_install"]]
+    if py:
+        venv.parent.mkdir(parents=True, exist_ok=True)
+    phases = [("install", [str(venv) if a == "{venv}" else a for a in c]) for c in plan["local_install"]]
     phases += [("build", local(plan["build"]))] if plan["build"] else []
     phases += [("smoke", None)] if plan["start"] else []
     phases += [("test", local(plan["test"]))] if plan["test"] else []
@@ -642,8 +678,9 @@ def build_and_test(project: Path, art: Path, log_name: str = "build-test.log") -
 
         def runner(cmd, network, ci):
             env = [x for e in [f"CI={ci}", f"PORT={port}", *plan["env"]] for x in ("-e", e)]
+            venv = ["-v", f"{venv_dir(project, 'docker')}:{VENV}"] if plan["runtime"] == "python" else []
             return [DOCKER, "run", "--rm", "--cpus", "2", "--memory", "4g", "--pids-limit", "512",
-                    *([] if network else ["--network", "none"]), *env,
+                    *([] if network else ["--network", "none"]), *env, *venv,
                     "-v", f"{project.resolve()}:/app", "-w", "/app", plan["image"], *cmd]
     else:
         return {"status": "skipped", "mode": "none", "smoke": {"status": "skipped", "detail": "Docker is not running"},
@@ -888,15 +925,23 @@ def dry_run(card: dict, src_root: Path) -> dict:
         for proj in applied["projects"]:
             ok_p, out = relock(tmp / proj, [n for p, n in applied["updates"] if p == proj])
             ok, log = ok and ok_p, log + out
+        python = any(ch.get("field") == "requirements" for ch in changes)
         if ok:
-            return {"ok": True, "reason": "npm resolves the dependency tree with this fix", "blamed": [], "log": ""}
+            return {"ok": True, "blamed": [], "log": "", "reason": "uv resolves the requirements with this fix" if python
+                    else "npm resolves the dependency tree with this fix"}
+        if python:
+            why = [l.strip(" ×╰─▶") for l in log.splitlines()
+                   if re.search(r"No solution|Because|depends on|unsatisfiable|error", l)]
+            return {"ok": False, "blamed": [], "log": log[-4000:], "tool": "uv",
+                    "reason": "; ".join(w for w in why[:3] if w) or "uv could not resolve the requirements with this fix "
+                                                                   "(pip would fail the same way)"}
         errors = [l.strip() for l in log.splitlines() if "npm error" in l and "A complete log" not in l]
         blamed = []
         for rx in NPM_BLAME:
             for n in rx.findall("\n".join(errors)):
                 if n not in blamed:
                     blamed.append(n)
-        return {"ok": False, "blamed": blamed, "log": log[-4000:],
+        return {"ok": False, "blamed": blamed, "log": log[-4000:], "tool": "npm",
                 "reason": "; ".join(e.removeprefix("npm error").strip() for e in errors[:3]) or "npm could not resolve"}
     finally:
         _rmtree(tmp)

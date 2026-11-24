@@ -1,7 +1,4 @@
-import os
 import re
-import shutil
-import stat
 from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
@@ -149,12 +146,6 @@ def cancel_scan(scan_id: str):
     return {"status": scan["status"]}
 
 
-def _force_remove(func, path, _exc):
-    # git marks pack files read-only; Windows refuses to delete those until the flag is cleared
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
-
-
 @app.delete("/api/scans/{scan_id}", status_code=204)
 def delete_scan(scan_id: str):
     """Remove a scan: its DB rows, its evidence folder and the cloned repo."""
@@ -171,7 +162,7 @@ def delete_scan(scan_id: str):
     db.delete(scan_id)
     for folder in (db.DATA / "workspaces" / scan_id, db.DATA / "scans" / scan_id):
         if folder.exists():
-            shutil.rmtree(folder, onerror=_force_remove)
+            validate._rmtree(folder)
 
 
 @app.get("/api/scans/{scan_id}/artifacts/{name:path}")
