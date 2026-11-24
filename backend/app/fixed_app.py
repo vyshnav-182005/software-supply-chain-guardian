@@ -45,7 +45,13 @@ def ensure_copy(scan_id: str) -> Path:
         _rmtree(dst)
         shutil.copytree(db.DATA / "workspaces" / scan_id / "repo", dst, ignore=shutil.ignore_patterns("node_modules"))
         _git(dst, "checkout", "-q", "-b", "fix/guardian")
-        _git(dst, "tag", "guardian-original")  # the scanned commit, for the patch and diffs
+        # lockfiles generated at scan time are not in the repo: commit them as the baseline so the patch
+        # and rollbacks only show what the fixes change
+        locks = [p.relative_to(dst).as_posix() for p in dst.rglob("package-lock.json") if "node_modules" not in p.parts]
+        if locks:
+            _git(dst, "add", "-f", "--", *locks)
+            _git(dst, *GIT_ID, "commit", "-q", "-m", "Guardian: baseline lockfiles (resolved at scan time)")
+        _git(dst, "tag", "guardian-original")
     return dst
 
 
@@ -95,12 +101,13 @@ def apply_card(scan_id: str, card_id: str) -> None:
                 rec.update(status="manual" if applied.get("manual") or card["action"] in ("replace", "remove")
                            else "apply_failed", reason=applied["detail"])
                 return
-            if not _git(root, "status", "--porcelain").strip():
+            if not _git(root, "status", "--porcelain", "--untracked-files=no").strip():
                 rec.update(status="already_applied", reason="The fixed copy already contains this change")
                 return
-            _git(root, "add", "-A")
+            _git(root, "add", "-u")  # tracked files only: never build output or node_modules
             _git(root, *GIT_ID, "commit", "-q", "-m", f"Guardian fix {card_id}: {card['title']}")
             rec.update(status="applied", reason=applied["detail"], diff=applied.get("diff", ""),
+                       changes=card2["changes"] if card["action"] in PACKAGE_ACTIONS else [],
                        commit=_git(root, "rev-parse", "HEAD").strip(), kind=applied["kind"],
                        projects=applied.get("projects"), updates=applied.get("updates"))
             stale = db.validations(scan_id).get(FIXED)
@@ -135,8 +142,41 @@ def _applied(scan_id: str, cards: list) -> list[tuple[dict, dict]]:
     return [(c, vals[c["id"]]) for c in cards if vals.get(c["id"], {}).get("status") == "applied"]
 
 
+def _undo(root: Path, val: dict) -> None:
+    """Put back what one card changed in package.json (overrides entry removed, version restored).
+    Done by editing, not `git revert`, so neighbouring changes from other fixes never conflict."""
+    for ch in val.get("changes") or []:
+        if ch.get("field") in (None, "lockfile"):
+            continue  # lockfile-only fixes are undone by leaving them out of the next relock
+        manifest = root / ch["manifest"].replace("package-lock.json", "package.json")
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        section = data.get(ch["field"]) or {}
+        if ch["field"] == "overrides" or not ch.get("spec_from"):
+            section.pop(ch["package"], None)
+            if ch["field"] == "overrides" and not section:
+                data.pop("overrides", None)
+        else:
+            section[ch["package"]] = ch["spec_from"]
+        manifest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def _commit_tracked(root: Path, message: str, extra: list[str] = ()) -> None:
+    _git(root, "add", "-u")
+    if extra:
+        _git(root, "add", "-f", "--", *extra)
+    if _git(root, "status", "--porcelain", "--untracked-files=no").strip():
+        _git(root, *GIT_ID, "commit", "-q", "-m", message)
+
+
+def _culprit(pkg: list) -> tuple[dict, dict]:
+    """Most likely to break the build: the latest fix with a major version jump, else the latest fix."""
+    major = [(c, v) for c, v in pkg if any(ch.get("jump") == "major" for ch in v.get("changes") or [])]
+    return (major or pkg)[-1]
+
+
 def _rollback(scan_id: str, root: Path, card: dict, val: dict, why: str, log: str, rec: dict, step: Step) -> None:
-    _git(root, "revert", "--no-edit", val["commit"])
+    _undo(root, val)
+    _commit_tracked(root, f"Guardian: roll back {card['title']}")
     db.save_validation(scan_id, card["id"], {**val, "status": "rolled_back", "reason": why, "rollback_log": log})
     rec["rollbacks"].append({"fix": card["title"], "why": why})
     step(f"rollback_{len(rec['rollbacks'])}", "done", f"Rolled back '{card['title']}': {why}")
@@ -175,19 +215,24 @@ def _build(scan_id: str, rec: dict, step: Step) -> None:
             if attempt == MAX_ROLLBACKS:
                 rec.update(status="failed", reason="npm could not resolve the dependency tree, even after rollbacks.")
                 return
-            c, v = pkg[-1]
+            c, v = _culprit(pkg)
             _rollback(scan_id, root, c, v, "npm could not resolve the dependency tree with this fix", out[-4000:], rec, step)
             continue
-        _git(root, "add", "-A")
-        if _git(root, "status", "--porcelain").strip():
-            _git(root, *GIT_ID, "commit", "-q", "-m", "Guardian: regenerate lockfiles")
+        _commit_tracked(root, "Guardian: regenerate lockfiles",
+                        [f"{p}/package-lock.json".lstrip("./") or "package-lock.json" for p in projects
+                         if (root / p / "package-lock.json").is_file()])
         step("relock", "done", "Regenerated package-lock.json for all applied fixes", log="relock.log")
         build_res = build_and_test(root / projects[0], art)
         broke = build_res["status"] == "failed" and build_res.get("phase") in ("install", "build")
         broke = broke or (build_res.get("smoke") or {}).get("status") == "failed"
-        if not broke or not pkg or attempt == MAX_ROLLBACKS:
+        if not broke or not pkg:
             break
-        c, v = pkg[-1]
+        if attempt == MAX_ROLLBACKS - 1:  # last resort: undo every package fix so the app runs again
+            for c, v in reversed(pkg):
+                _rollback(scan_id, root, c, v, "the app still did not build with the package fixes together; "
+                          "all package fixes were rolled back so the app runs", "", rec, step)
+            continue
+        c, v = _culprit(pkg)
         log_text = (art / build_res["log"]).read_text(encoding="utf-8")[-4000:] if build_res.get("log") else ""
         _rollback(scan_id, root, c, v, "the build or the app broke with this fix", log_text, rec, step)
     step("build_test", build_res["status"], build_res["detail"], mode=build_res.get("mode"), log=build_res.get("log"))

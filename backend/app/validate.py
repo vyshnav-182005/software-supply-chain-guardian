@@ -196,6 +196,9 @@ def apply_change(card: dict, res: dict, root: Path) -> dict:
                 projects.append(project)
             data = json.loads(manifest.read_text(encoding="utf-8"))
             before = json.dumps(data, indent=2)
+            if not ch.get("field") and not ch.get("spec_from") and action not in ("override", "pin", "relock"):
+                details.append(f"{ch['package']} is not listed in {ch['manifest']}: left unchanged")
+                continue  # never add a brand-new dependency by accident
             if ch.get("field") == "lockfile" or action == "relock":
                 updates.append((project, ch["package"]))
                 details.append(f"lockfile refresh: {ch['package']} -> {ch['to']} (package.json unchanged)")

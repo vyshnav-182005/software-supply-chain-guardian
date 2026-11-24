@@ -134,6 +134,8 @@ if __name__ == "__main__":
     fixed_app.build(sid)
     rec = db.validations(sid)["fixed"]
     assert rec["rollbacks"] and db.validations(sid)["c1"]["status"] == "rolled_back", rec
+    assert json.loads((fx / "package.json").read_text())["dependencies"]["mongodb"] == "^2.2.36"  # undone by editing
+    assert (fx / "Dockerfile").read_text().startswith("FROM alpine@sha256:")                       # other fix kept
     assert rec["status"] == "running_ok", (rec["status"], rec.get("reason"), rec["steps"])
     assert rec["comparison"]["advisories_before"] == 1
     assert rec["comparison"]["advisories_after"] == 0 and rec["comparison"]["removed"][0]["id"] == "GHSA-bson"
