@@ -6,6 +6,7 @@ export const VSTATUS: Record<string, { label: string; cls: string }> = {
   queued: { label: 'Queued', cls: 'unrated' },
   running: { label: 'Validating…', cls: 'unrated' },
   verified: { label: '✅ Verified', cls: 'low' },
+  fixed_app_runs: { label: '✅ Fixed, app runs (tests not run)', cls: 'low' },
   fixed_untested: { label: '⚠️ Fixed, not tested', cls: 'medium' },
   fixed_tests_failed: { label: '⚠️ Fixed, tests failed', cls: 'medium' },
   not_fixed: { label: '❌ Not fixed / new risk', cls: 'critical' },
@@ -45,6 +46,13 @@ export default function ValidationTab({ scanId, cards, validations, onRerun }: {
   }
   const queued = Object.values(validations).filter((v) => v.status === 'queued').map((v) => v.card_id)
 
+  const combined = validations.combined
+  async function runCombined() {
+    const r = await fetch(`/api/scans/${scanId}/combined`, { method: 'POST' }).catch(() => null)
+    if (!r?.ok) return setErr(r ? (await r.json()).detail : 'Backend not reachable')
+    onRerun()
+  }
+
   async function rerun(cardId: string) {
     const r = await fetch(`/api/scans/${scanId}/validations/${cardId}`, { method: 'POST' }).catch(() => null)
     if (!r?.ok) return setErr(r ? (await r.json()).detail : 'Backend not reachable')
@@ -75,6 +83,19 @@ export default function ValidationTab({ scanId, cards, validations, onRerun }: {
         </section>
       )}
       {err && <div className="alert">{err}</div>}
+
+      <section className="card">
+        <div className="row-between">
+          <h2>All approved fixes together</h2>
+          {combined?.status === 'queued' || combined?.status === 'running'
+            ? <button className="link" onClick={() => cancel(['combined'])}>Stop after the current step</button>
+            : <button onClick={runCombined}>{combined ? 'Run again' : 'Validate all approved fixes together'}</button>}
+        </div>
+        <p className="small muted">Applies every approved fix on one branch (<span className="mono">fix/combined</span>), resolving shared
+          parents to the highest safe version, then relocks, builds, starts the app, runs the tests and rescans once. This is
+          the proof that the fixes work together and the application still runs.</p>
+        {combined && <CombinedResult v={combined} scanId={scanId} />}
+      </section>
 
       <section className="card">
         <div className="row-between">
@@ -137,6 +158,55 @@ export default function ValidationTab({ scanId, cards, validations, onRerun }: {
             ))}</tbody>
           </table>
         </section>
+      )}
+    </div>
+  )
+}
+
+function CombinedResult({ v, scanId }: { v: Validation; scanId: string }) {
+  const c: any = v.comparison
+  const smoke = v.build?.smoke
+  return (
+    <div className="vcard">
+      <div className="row-between"><b>{v.card_title ?? 'Combined fixes'}</b><ValidationBadge v={v} /></div>
+      {v.reason && <p className="small">{v.reason}</p>}
+      {smoke && smoke.status !== 'not_applicable' && (
+        <div className={`app-run ${smoke.status === 'passed' ? 'ok' : 'bad'}`}>
+          <b>{smoke.status === 'passed' ? `App runs ✅  GET / → HTTP ${smoke.http_status}` : `App: ${smoke.status}`}</b>
+          <span className="small"> {smoke.detail}</span>
+          {smoke.log_excerpt && <pre className="code">{smoke.log_excerpt}</pre>}
+        </div>
+      )}
+      <ol className="vsteps">
+        {(v.steps ?? []).map((s) => (
+          <li key={s.name} className={s.status}>
+            <b>{s.name.replaceAll('_', ' ')}</b> <span className="chip">{s.status}</span>{s.mode && <span className="chip">{s.mode}</span>}
+            <span className="small"> {s.detail}</span>
+            {s.log && <a className="small" href={artifactUrl(scanId, `fix-combined/${s.log}`)}> log</a>}
+          </li>
+        ))}
+      </ol>
+      {!!v.not_applied?.length && <p className="small note">Not applied automatically: {v.not_applied.map((x) => `${x.fix} (${x.why})`).join('; ')}</p>}
+      {c?.remaining && (
+        <>
+          <table className="table compact">
+            <thead><tr><th></th><th>Critical</th><th>High</th><th>Medium</th><th>Low</th><th>Total advisories</th></tr></thead>
+            <tbody>
+              <tr><td>Before</td>{['critical', 'high', 'medium', 'low'].map((k) => <td key={k}>{c.severity_before[k]}</td>)}<td><b>{c.advisories_before}</b></td></tr>
+              <tr><td>After</td>{['critical', 'high', 'medium', 'low'].map((k) => <td key={k}>{c.severity_after[k]}</td>)}<td><b>{c.advisories_after}</b></td></tr>
+            </tbody>
+          </table>
+          <h3>What is still there, and why ({c.remaining.length})</h3>
+          <div className="table-wrap short">
+            <table className="table compact">
+              <thead><tr><th>Severity</th><th>Package</th><th>Advisory</th><th>Why it remains</th></tr></thead>
+              <tbody>{c.remaining.map((x: any) => (
+                <tr key={x.package + x.id}><td><span className={`sev ${x.severity}`}>{x.severity}</span></td>
+                  <td className="mono small">{x.package}</td><td className="mono small">{x.id}</td><td className="small">{x.reason}</td></tr>
+              ))}</tbody>
+            </table>
+          </div>
+        </>
       )}
     </div>
   )

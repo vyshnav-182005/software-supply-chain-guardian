@@ -150,8 +150,10 @@ export interface Validation {
                  new_advisories: { package: string; id: string; severity: string }[]
                  new_suspicious: { title: string; severity: string; rule: string }[]
                  advisories_before: number; advisories_after: number }
-  build?: { status: string; mode?: string; detail: string; log?: string }
+  build?: { status: string; mode?: string; detail: string; log?: string
+            smoke?: { status: string; detail: string; http_status?: number | null; url?: string; log_excerpt?: string } }
   ai?: AiResult
+  applied?: string[]; not_applied?: { fix: string; why: string }[]
 }
 
 export interface Decision { card_id: string; decision: 'approved' | 'rejected'; decided_by: string; note: string; decided_at: string }

@@ -467,6 +467,7 @@ For each approved card, the steps run in order (live):
 | Badge | Meaning |
 |---|---|
 | ✅ Verified | the target vulnerability/finding is gone, nothing new appeared, build/tests passed (or not needed) |
+| ✅ Fixed, app runs (tests not run) | fixed, nothing new, the app started and answered `GET /` (e.g. HTTP 200), but the test suite could not run in the sandbox (e.g. it needs Chrome or a database) |
 | ⚠️ Fixed, not tested | fixed and nothing new, but build/tests did not run (Docker not running) |
 | ⚠️ Fixed, tests failed | fixed, but the build or tests failed. The AI explains why from the log |
 | ❌ Not fixed / new risk | the target is still there, or a new high/critical risk appeared |
@@ -481,11 +482,33 @@ up to 20 minutes). **Cancel** removes a queued validation, **Stop after the curr
 one, and **Cancel all N queued** clears the queue, so you can keep just one or two fixes for a demo.
 The branch is named after the package that is changed, e.g. `fix/sanitize-html-2.18.0`.
 
+### All approved fixes together (branch `fix/combined`)
+
+Click **Validate all approved fixes together** after approving the fixes you want. It:
+
+1. copies the scanned repo to `fix-combined` on branch `fix/combined`;
+2. applies **every** approved fix at once. When two fixes change the same package (a shared parent
+   such as express-jwt), the higher target version wins. Config fixes are applied too. Cards that need a
+   person (replace / remove) are listed as "not applied";
+3. relocks once, runs `npm ci` and the build;
+4. **starts the app** in the sandbox (`npm start`, network off), waits for port 3000 and requests `GET /`.
+   "**App runs ✅ GET / → HTTP 200**" plus the end of the app's log is the proof that the application still
+   works with all fixes in place;
+5. runs the tests, then rescans once.
+
+It then shows advisories **before → after** by severity, and **every advisory that remains, with the honest
+reason**: "no fixed version has been published" (e.g. marsdb), "fix rejected", "fix not approved yet",
+"below the fix threshold" (low/medium risks without a card), "fix applied, but another route still pulls in
+this version", "needs a manual change", or "new: brought in by one of the upgrades". Nothing is hidden:
+Juice Shop is deliberately vulnerable and some packages have no fix at all.
+
 ### Report
 
 - **Summary**: written by the AI only from the verified numbers (any other number is rejected), or a
   rule-generated sentence.
 - **Before / after table**: risk counts per band. "After" subtracts only ✅ Verified fixes.
+- **All fixes together** (in the Markdown export): advisories before → after, whether the app runs, and
+  the table of remaining advisories with their reasons.
 - **Remaining risk**: open, rejected, accepted (low band or not reachable), awaiting decision, resolved.
 - **Audit trail**: for every card: finding (score and formula) → decision (who, when) → validation
   result and rescan summary.

@@ -331,3 +331,7 @@ button.reject { background: var(--bad); color: #2a0606; }
 .vsteps { margin: 8px 0; padding-left: 20px; } .vsteps li { margin: 4px 0; }
 .vsteps li.failed b, .vsteps li.manual b { color: var(--bad); } .vsteps li.done b, .vsteps li.passed b { color: var(--ok); }
 .reconcile { background: var(--panel-2); border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; }
+.app-run { border-radius: 8px; padding: 10px 12px; margin: 8px 0; }
+.app-run.ok { background: rgba(52, 211, 153, .12); border: 1px solid rgba(52, 211, 153, .4); }
+.app-run.bad { background: rgba(248, 113, 113, .1); border: 1px solid rgba(248, 113, 113, .4); }
+.fixcard.v-fixed_app_runs { border-left: 4px solid var(--ok); }
