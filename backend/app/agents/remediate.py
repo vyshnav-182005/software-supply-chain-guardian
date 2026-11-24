@@ -30,7 +30,7 @@ from semantic_version import NpmSpec, Version
 from .. import llm  # noqa: F401  (importing llm loads backend/.env)
 from .prioritize import band, fetch_json, find_usages
 
-MAX_CARDS = 15
+MAX_CARDS = 60
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")  # optional; read after llm loads backend/.env
 REGISTRY = "https://registry.npmjs.org/"
 
@@ -310,8 +310,8 @@ def finish(card, r, action, title, changes, t_after, steps, note, patch, rollbac
 def run(state: dict) -> tuple[dict, dict]:
     comps = {c["id"]: c for c in state["components"]}
     paths, root = state.get("paths", {}), Path(state["workdir"])
-    top = [r for r in state.get("risks", []) if r["band"] in ("critical", "high")
-           and "known malware" not in r["labels"] and r.get("advisories")][:MAX_CARDS]
+    # every band, critical to low, in priority order, so as many advisories as possible can be removed
+    top = [r for r in state.get("risks", []) if "known malware" not in r["labels"] and r.get("advisories")][:MAX_CARDS]
     known_ids = {x for v in state.get("vulnerabilities", []) for x in [v["advisory_id"], *v["aliases"]]}
     cards, errors = [], []
     for r in top:

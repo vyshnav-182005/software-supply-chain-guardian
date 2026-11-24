@@ -11,7 +11,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from . import db, llm, pipeline, report, validate
+from . import db, fixed_app, llm, pipeline, report, validate
 from .agents.checkout import GITHUB_URL
 
 app = FastAPI(title="Software Supply Chain Guardian")
@@ -64,15 +64,15 @@ def decide(scan_id: str, d: Decision, bg: BackgroundTasks):
     if d.card_id not in cards:
         raise HTTPException(404, "Fix card not found in this scan")
     row = db.decide(scan_id, d.card_id, d.decision, d.decided_by.strip() or "reviewer", d.note.strip())
-    if d.decision == "approved":  # Validate starts on approval, in the background
-        db.save_validation(scan_id, d.card_id, {"card_id": d.card_id, "status": "queued", "steps": []})
-        bg.add_task(validate.run, scan_id, d.card_id)
+    if d.decision == "approved":  # Approve applies the fix to the scan's fixed copy of the app
+        db.save_validation(scan_id, d.card_id, {"card_id": d.card_id, "status": "applying", "steps": []})
+        bg.add_task(fixed_app.apply_card, scan_id, d.card_id)
     return row
 
 
 @app.post("/api/scans/{scan_id}/validations/{card_id}")
 def revalidate(scan_id: str, card_id: str, bg: BackgroundTasks):
-    """Run Validate again for an approved card (e.g. after starting Docker)."""
+    """Optional: test one approved fix alone on its own branch (fix-<card>), apart from the fixed copy."""
     if db.decisions(scan_id).get(card_id, {}).get("decision") != "approved":
         raise HTTPException(409, "Only approved fixes are validated")
     if db.validations(scan_id).get(card_id, {}).get("status") in ("queued", "running"):
@@ -82,16 +82,27 @@ def revalidate(scan_id: str, card_id: str, bg: BackgroundTasks):
     return {"status": "queued"}
 
 
-@app.post("/api/scans/{scan_id}/combined")
-def validate_combined(scan_id: str, bg: BackgroundTasks):
-    """Apply all approved fixes together on fix/combined, build, start the app, test and rescan once."""
-    if not any(d["decision"] == "approved" for d in db.decisions(scan_id).values()):
-        raise HTTPException(409, "Approve at least one fix first")
-    if db.validations(scan_id).get(validate.COMBINED, {}).get("status") in ("queued", "running"):
-        raise HTTPException(409, "The combined validation is already running")
-    db.save_validation(scan_id, validate.COMBINED, {"card_id": validate.COMBINED, "status": "queued", "steps": []})
-    bg.add_task(validate.run_combined, scan_id)
+@app.post("/api/scans/{scan_id}/fixed/build")
+def build_fixed(scan_id: str, bg: BackgroundTasks):
+    """Build, verify and run the fixed copy that holds every applied fix."""
+    vals = db.validations(scan_id)
+    if not any(v.get("status") == "applied" for v in vals.values()):
+        raise HTTPException(409, "Approve at least one fix first (it must show 'Applied')")
+    if vals.get(fixed_app.FIXED, {}).get("status") in ("queued", "running") or             any(v.get("status") == "applying" for v in vals.values()):
+        raise HTTPException(409, "Still busy: wait for the current step to finish")
+    db.save_validation(scan_id, fixed_app.FIXED, {"card_id": fixed_app.FIXED, "status": "queued", "steps": []})
+    bg.add_task(fixed_app.build, scan_id)
     return {"status": "queued"}
+
+
+@app.post("/api/scans/{scan_id}/fixed/stop")
+def stop_fixed_app(scan_id: str):
+    return {"stopped": fixed_app.stop_app(scan_id)}
+
+
+@app.get("/api/scans/{scan_id}/fixed/app")
+def fixed_app_status(scan_id: str):
+    return fixed_app.app_status(scan_id)
 
 
 @app.delete("/api/scans/{scan_id}/validations/{card_id}")
@@ -153,18 +164,19 @@ def delete_scan(scan_id: str):
         raise HTTPException(409, "Scan is still running: stop it first, then delete it")
     if any(v.get("status") in ("queued", "running") for v in db.validations(scan_id).values()):
         raise HTTPException(409, "A fix is being validated: wait for it to finish, then delete the scan")
+    fixed_app.stop_app(scan_id)
     db.delete(scan_id)
     for folder in (db.DATA / "workspaces" / scan_id, db.DATA / "scans" / scan_id):
         if folder.exists():
             shutil.rmtree(folder, onerror=_force_remove)
 
 
-@app.get("/api/scans/{scan_id}/artifacts/{name}")
+@app.get("/api/scans/{scan_id}/artifacts/{name:path}")
 def get_artifact(scan_id: str, name: str):
     """Evidence files (SBOM, generated lockfiles, tool outputs) for download."""
     base = (db.DATA / "scans" / scan_id).resolve()
     path = (base / name).resolve()
-    if path.parent != base or not path.is_file():
+    if not path.is_relative_to(base) or not path.is_file():  # sub-folders allowed (fix logs, patch)
         raise HTTPException(404, "Artifact not found")
     return FileResponse(path, filename=f"{scan_id}-{name}")
 

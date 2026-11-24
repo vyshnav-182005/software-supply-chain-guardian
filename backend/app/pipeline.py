@@ -73,8 +73,9 @@ def _node(key, fn):
             update, public = fn(state)
         except Exception as e:
             traceback.print_exc()
+            msg = str(e)
             db.update(sid, lambda d: d["agents"][key].update(
-                status="failed", error=str(e), duration=round(time.time() - start, 2)))
+                status="failed", error=msg, duration=round(time.time() - start, 2)))
             raise
 
         def save(d):
@@ -114,10 +115,10 @@ def run(scan_id: str, repo_url: str) -> None:
                       "workdir": str(workspace / "repo"), "artifacts": str(artifacts)})
         db.update(scan_id, lambda d: d.update(status="completed"))
     except Exception as e:
-        cancelled = isinstance(e, ScanCancelled)
+        cancelled, msg = isinstance(e, ScanCancelled), str(e)
 
         def fail(d):
-            d.update(status="cancelled" if cancelled else "failed", error=str(e))
+            d.update(status="cancelled" if cancelled else "failed", error=msg)
             for a in d["agents"].values():
                 if a["status"] in ("pending", "running"):
                     a["status"] = "skipped"

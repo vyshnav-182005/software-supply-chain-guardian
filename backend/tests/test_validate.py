@@ -99,24 +99,44 @@ if __name__ == "__main__":
     assert f["risk_bands_before"] == {"critical": 0, "high": 1, "medium": 1, "low": 1}
     assert f["risk_bands_after"] == {"critical": 0, "high": 1, "medium": 0, "low": 1}
     assert rep["summary"]["source"] == "rule" and "Supply-chain report" in report.markdown(rep)
-    # Combined: every approved fix together on fix/combined, remaining advisories explained
-    db.decide(sid, "c1", "approved", "reviewer", "")
-    after["vulnerabilities"] = [{"name": "marsdb", "version": "0.6.11", "advisory_id": "GHSA-m", "severity": "critical",
-                                 "fixed_versions": [], "fix": None}]
-    validate.run_combined(sid)
-    cv = db.validations(sid)["combined"]
-    assert cv["branch"] == "fix/combined" and len(cv["applied"]) == 2, cv
-    assert cv["comparison"]["advisories_before"] == 1 and cv["comparison"]["advisories_after"] == 1
-    assert cv["comparison"]["remaining"][0]["reason"] == "new: brought in by one of the upgrades"
-    assert cv["status"] == "not_fixed"                                    # a new critical appeared
-    comb = db.DATA / "workspaces" / sid / "fix-combined"
-    assert json.loads((comb / "package.json").read_text())["dependencies"]["mongodb"] == "^3.1.13"
-    assert (comb / "Dockerfile").read_text().startswith("FROM alpine@sha256:")
-    assert report.build(sid)["facts"]["combined"]["advisories_after"] == 1
-    from app.validate import merge_changes
-    m = merge_changes([{"action": "upgrade", "change": {"manifest": "package.json", "field": "dependencies",
-                                                        "package": "express-jwt", "to": "6.0.0"}},
-                       {"action": "upgrade-all", "changes": [{"manifest": "package.json", "field": "dependencies",
-                                                              "package": "express-jwt", "to": "8.4.1"}]}])
-    assert len(m) == 1 and m[0]["to"] == "8.4.1"                          # shared parent: highest target wins
+    # Fixed copy: Approve applies the fix cumulatively; one build verifies and runs the fixed app
+    from app import fixed_app
+    sid, repo = make_scan()
+    fixed_app.apply_card(sid, "c1")
+    fixed_app.apply_card(sid, "c2")
+    vals = db.validations(sid)
+    assert vals["c1"]["status"] == "applied" and vals["c2"]["status"] == "applied", vals
+    fx = fixed_app.workdir(sid)
+    assert json.loads((fx / "package.json").read_text())["dependencies"]["mongodb"] == "^3.1.13"
+    assert (fx / "Dockerfile").read_text().startswith("FROM alpine@sha256:")
+    assert json.loads((repo / "package.json").read_text())["dependencies"]["mongodb"] == "^2.2.36"  # original untouched
+    fixed_app.apply_card(sid, "c1")                                     # same change twice: nothing new
+    assert db.validations(sid)["c1"]["status"] == "already_applied"
+    db.save_validation(sid, "c1", vals["c1"])
+    # a later card must not lower a version another fix raised
+    low = {"action": "upgrade", "changes": [{"package": "mongodb", "to": "3.0.0", "spec_from": "^2.2.36",
+                                             "field": "dependencies", "manifest": "package.json"}]}
+    assert fixed_app.without_downgrades(low, fx)[0]["changes"] == []
+
+    calls = {"n": 0}
+
+    def fake_build(project, art):
+        calls["n"] += 1
+        if calls["n"] == 1:  # the first build breaks: the latest package fix must be rolled back
+            return {"status": "failed", "phase": "build", "detail": "'build' failed (1)", "mode": "docker sandbox", "smoke": {}}
+        return {"status": "passed", "detail": "Passed: install, build", "mode": "test",
+                "smoke": {"status": "passed", "http_status": 200, "detail": "App started"}}
+    fixed_app.build_and_test = fake_build
+    fixed_app.relock = lambda project, update: (True, "ok")
+    fixed_app.stop_app = lambda scan_id: True
+    after["vulnerabilities"] = []
+    fixed_app.rescan = lambda scan, root, art: after
+    fixed_app.build(sid)
+    rec = db.validations(sid)["fixed"]
+    assert rec["rollbacks"] and db.validations(sid)["c1"]["status"] == "rolled_back", rec
+    assert rec["status"] == "running_ok", (rec["status"], rec.get("reason"), rec["steps"])
+    assert rec["comparison"]["advisories_before"] == 1
+    assert rec["comparison"]["advisories_after"] == 0 and rec["comparison"]["removed"][0]["id"] == "GHSA-bson"
+    assert (db.DATA / "scans" / sid / "fixed" / "fixed.patch").exists()
+    assert report.build(sid)["facts"]["combined"]["fixes_rolled_back"] == 1
     print("validate ok")

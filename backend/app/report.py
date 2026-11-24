@@ -25,7 +25,7 @@ def build(scan_id: str) -> dict:
     scan = db.get(scan_id)
     res = scan["results"]
     decisions, validations = db.decisions(scan_id), db.validations(scan_id)
-    combined = validations.pop("combined", None)  # all approved fixes applied together (separate from per-card runs)
+    combined = validations.pop("fixed", None)  # the fixed copy: every applied fix built, verified and run
     risks = res.get("prioritize", {}).get("risks", [])
     cards = res.get("remediate", {}).get("cards", [])
     risk_by_id = {r["id"]: r for r in risks}
@@ -91,8 +91,11 @@ def build(scan_id: str) -> dict:
         reasons: dict = {}
         for x in cmp_["remaining"]:
             reasons[x["reason"]] = reasons.get(x["reason"], 0) + 1
-        facts["combined"] = {"status": combined["status"], "fixes_applied": len(combined.get("applied", [])),
-                             "fixes_not_applied": len(combined.get("not_applied", [])),
+        facts["combined"] = {"status": combined["status"], "fixes_applied": len(combined.get("fixes_applied", [])),
+                             "fixes_not_applied": len(combined.get("fixes_not_applied", [])),
+                             "fixes_rolled_back": len(combined.get("rollbacks", [])),
+                             "advisories_removed": len(cmp_.get("removed", [])),
+                             "app_url": (combined.get("app") or {}).get("url"),
                              "advisories_before": cmp_["advisories_before"], "advisories_after": cmp_["advisories_after"],
                              "severity_before": cmp_["severity_before"], "severity_after": cmp_["severity_after"],
                              "app_runs": smoke.get("status") == "passed", "app_http_status": smoke.get("http_status"),
@@ -149,10 +152,12 @@ def markdown(rep: dict) -> str:
     c = rep.get("combined")
     if c and c.get("comparison"):
         cf = f["combined"]
-        out += ["## All approved fixes together (branch fix/combined)", "",
+        out += ["## The fixed application (branch fix/guardian)", "",
                 f"- Result: {c['status']} - {c.get('reason', '')}",
                 f"- Advisories: {cf['advisories_before']} -> {cf['advisories_after']}",
                 f"- App: {'runs, GET / answered HTTP ' + str(cf['app_http_status']) if cf['app_runs'] else 'not confirmed running'}",
+                f"- Fixes applied {cf['fixes_applied']}, not applied {cf['fixes_not_applied']}, rolled back {cf['fixes_rolled_back']}",
+                "", "Removed advisories: " + ", ".join(f"{x['package']} {x['id']}" for x in c["comparison"].get("removed", [])[:60]),
                 "", "| Remaining advisory | Severity | Why it is still there |", "|---|---|---|"]
         out += [f"| {x['package']} {x['id']} | {x['severity']} | {x['reason']} |" for x in c["comparison"]["remaining"]]
     return "\n".join(out)
