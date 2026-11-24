@@ -19,6 +19,7 @@ export const VSTATUS: Record<string, { label: string; cls: string }> = {
   running_ok: { label: '✅ Fixed app runs', cls: 'low' },
   built: { label: '⚠️ Built, app not confirmed', cls: 'medium' },
   failed: { label: '❌ Build failed', cls: 'critical' },
+  original_fails: { label: '⚠️ The original app fails too (not the fixes)', cls: 'medium' },
   verified: { label: '✅ Verified', cls: 'low' },
   fixed_app_runs: { label: '✅ Fixed, app runs (tests not run)', cls: 'low' },
   fixed_untested: { label: '⚠️ Fixed, not tested', cls: 'medium' },

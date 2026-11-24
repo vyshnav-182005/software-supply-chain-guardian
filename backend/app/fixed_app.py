@@ -111,10 +111,10 @@ def apply_card(scan_id: str, card_id: str) -> None:
                 rec.update(status="manual" if applied.get("manual") or card["action"] in ("replace", "remove")
                            else "apply_failed", reason=applied["detail"])
                 return
-            if not _git(root, "status", "--porcelain", "--untracked-files=no").strip():
+            _git(root, "add", "-u")  # tracked files only: never build output or node_modules
+            if not _git(root, "diff", "--cached", "--name-only").strip():
                 rec.update(status="already_applied", reason="The fixed copy already contains this change")
                 return
-            _git(root, "add", "-u")  # tracked files only: never build output or node_modules
             _git(root, *GIT_ID, "commit", "-q", "-m", f"Guardian fix {card_id}: {card['title']}")
             rec.update(status="applied", reason=applied["detail"], diff=applied.get("diff", ""),
                        changes=card2["changes"] if card["action"] in PACKAGE_ACTIONS else [],
@@ -273,6 +273,18 @@ def _build(scan_id: str, rec: dict, step: Step) -> None:
                           "all package fixes were rolled back so the app runs", "", rec, step)
             continue
         log_text = (art / build_res["log"]).read_text(encoding="utf-8")[-4000:] if build_res.get("log") else ""
+        if not blamed_packages(log_text):  # nothing names a fixed package: does the original app break too?
+            original = original_build(root, build_res.get("project", projects[0]), art)
+            same = (original["status"] == "failed" and original.get("phase") == build_res.get("phase")) or \
+                (build_res.get("phase") is None and (original.get("smoke") or {}).get("status") == "failed")
+            step("original_check", "done", "The original app, without any fix, " +
+                 ("fails the same way: the fixes are kept" if same else f"passes ({original['detail']})"),
+                 log=original.get("log"))
+            if same:
+                build_res = {**build_res, "original_fails": True,
+                             "detail": f"{build_res['detail']}; the original app fails the same way without any fix, "
+                                       "so this is a problem in the app itself, not caused by the fixes"}
+                break
         c, v = _culprit(pkg, log_text)
         _rollback(scan_id, root, c, v, "the build or the app broke with this fix", log_text, rec, step)
     step("build_test", build_res["status"], build_res["detail"], mode=build_res.get("mode"), log=build_res.get("log"))
@@ -327,13 +339,30 @@ def _build(scan_id: str, rec: dict, step: Step) -> None:
         rec["app"] = run
         step("run_app", "done" if run["running"] else "failed", run["detail"])
     smoke_ok = smoke.get("status") == "passed"
-    if build_res["status"] == "failed" and not smoke_ok:
+    if build_res.get("original_fails") and not smoke_ok:
+        rec.update(status="original_fails", reason=f"{build_res['detail'].capitalize()}. See build-test-original.log.")
+    elif build_res["status"] == "failed" and not smoke_ok:
         rec.update(status="failed", reason=f"The fixed app did not build or start: {build_res['detail']}")
     elif smoke_ok:
         rec.update(status="running_ok", reason=f"The fixed app builds and runs (GET / -> HTTP {smoke.get('http_status')}). "
                                                f"Advisories {len(before)} -> {len(after['vulnerabilities'])}.")
     else:
         rec.update(status="built", reason=f"{build_res['detail']}. Advisories {len(before)} -> {len(after['vulnerabilities'])}.")
+
+
+def original_build(root: Path, project: str, art: Path) -> dict:
+    """Build the unfixed app (tag guardian-original) the same way, in a throwaway git worktree."""
+    tmp = root.parent / "original-check"
+    _rmtree(tmp)
+    try:
+        _git(root, "worktree", "prune")
+        _git(root, "worktree", "add", "--detach", "-f", str(tmp), "guardian-original")
+        return build_and_test(tmp / project, art, "build-test-original.log")
+    finally:
+        try:
+            _git(root, "worktree", "remove", "--force", str(tmp))
+        except RuntimeError:
+            _rmtree(tmp)
 
 
 def build_all(root: Path, projects: list[str], art: Path) -> dict:

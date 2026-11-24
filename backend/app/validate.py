@@ -174,7 +174,8 @@ def _git(cwd: Path, *args) -> str:
     out = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8",
                          errors="replace", timeout=120, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
     if out.returncode:
-        raise RuntimeError(f"git {args[0]}: {out.stderr.strip()[-300:]}")
+        cmd = next((a for a in args if not a.startswith("-") and "=" not in a), args[0])
+        raise RuntimeError(f"git {cmd}: {(out.stderr.strip() or out.stdout.strip())[-300:]}")
     return out.stdout
 
 
@@ -443,7 +444,7 @@ def detect_app(project: Path) -> dict:
         procfile = re.search(r"^web:\s*(.+)$", _read(project / "Procfile"), re.M)
         start = "npm start" if "start" in scripts else procfile.group(1).strip() if procfile else None
         return {"runtime": "node", "image": node_image(project), "port": SMOKE_PORT, "env": ["NODE_ENV=production"],
-                "install": ["npm", "ci", "--no-audit", "--no-fund", "--legacy-peer-deps"],
+                "install": ["npm", "ci", "--include=dev", "--no-audit", "--no-fund", "--legacy-peer-deps"],
                 "build": ["npm", "run", "build"] if "build" in scripts else None,
                 "test": ["npm", "test"] if "test" in scripts else None, "probe": NODE_PROBE, "start": start,
                 "why": None if start else "No start script, Procfile web process or Dockerfile CMD"}
@@ -500,8 +501,8 @@ def build_and_test(project: Path, art: Path, log_name: str = "build-test.log") -
     if docker_ready():
         mode = "docker sandbox"
 
-        def runner(cmd, network):
-            env = [x for e in ["CI=true", f"PORT={port}", *plan["env"]] for x in ("-e", e)]
+        def runner(cmd, network, ci):
+            env = [x for e in [f"CI={ci}", f"PORT={port}", *plan["env"]] for x in ("-e", e)]
             return [DOCKER, "run", "--rm", "--cpus", "2", "--memory", "4g", "--pids-limit", "512",
                     *([] if network else ["--network", "none"]), *env,
                     "-v", f"{project.resolve()}:/app", "-w", "/app", plan["image"], *cmd]
@@ -510,7 +511,7 @@ def build_and_test(project: Path, art: Path, log_name: str = "build-test.log") -
         phases = [p for p in phases if p[0] != "smoke"]
         smoke = {"status": "skipped", "detail": "The app is only started inside the Docker sandbox"}
 
-        def runner(cmd, network):
+        def runner(cmd, network, ci):
             return [NPM if cmd[0] == "npm" else cmd[0], *cmd[1:]] + (["--ignore-scripts"] if cmd[1] == "ci" else [])
     else:
         return {"status": "skipped", "mode": "none", "smoke": {"status": "skipped", "detail": "Docker is not running"},
@@ -526,9 +527,10 @@ def build_and_test(project: Path, art: Path, log_name: str = "build-test.log") -
             (art / log_name).write_text("\n".join(log), encoding="utf-8")
             return {"status": "failed", "mode": mode, "log": log_name, "smoke": smoke, "detail": f"Timed out before '{name}'"}
         try:
-            out = subprocess.run(runner(cmd, network), cwd=project, capture_output=True, text=True, encoding="utf-8",
+            ci = "true" if name == "test" else "false"  # CI=true turns lint warnings into build errors (CRA)
+            out = subprocess.run(runner(cmd, network, ci), cwd=project, capture_output=True, text=True, encoding="utf-8",
                                  errors="replace", timeout=min(left, 300) if name == "smoke" else left,
-                                 env={**clean_env, "CI": "true"})
+                                 env={**clean_env, "CI": ci})
             text = f"{out.stdout[-20000:]}\n{out.stderr[-20000:]}"
             code = out.returncode
         except subprocess.TimeoutExpired:
@@ -590,6 +592,8 @@ ENV_PATTERNS = [
     (re.compile(r"ChromeHeadless|CHROME_BIN|No binary for Chrome|Cannot start Chrome|Failed to launch the browser", re.I),
      "the tests need a browser (Chrome) that the sandbox image does not have"),
     (re.compile(r"ENOSPC|out of memory|JavaScript heap out of memory|Killed", re.I), "the sandbox ran out of resources"),
+    (re.compile(r"got \d+ SIGTERM/SIGINTs|SIGTERM received|\(timed out\)"), "the build was stopped (backend restarted, "
+     "cancelled or timed out), so it says nothing about the fixes"),
     (re.compile(r"OperationalError|could not connect to server|Connection refused|Can't connect to (MySQL|local)|"
                 r"SequelizeConnection", re.I), "a database the app needs is not running in the sandbox"),
     (re.compile(r"KeyError: '[A-Z][A-Z0-9_]+'|environment variable|ImproperlyConfigured|Missing required env|"

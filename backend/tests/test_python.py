@@ -101,4 +101,6 @@ if __name__ == "__main__":
     assert validate.detect_app(proj({"README.md": ""}))["runtime"] is None
     assert validate.environment_problem("django.db.utils.OperationalError: could not connect to server")
     assert validate.environment_problem("KeyError: 'SECRET_KEY'")
+    assert validate.environment_problem("got 3 SIGTERM/SIGINTs, forcefully exiting")
+    assert validate.detect_app(proj({"package.json": '{"scripts": {"build": "x"}}'}))["install"][2] == "--include=dev"
     print("python ok")
