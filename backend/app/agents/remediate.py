@@ -137,67 +137,172 @@ def changelog(name: str, frm: Version, to: Version) -> tuple[str, str]:
     return text, f"https://github.com/{m.group(1)}/{m.group(2)}/releases" if text else "no release notes between these versions"
 
 
-def plan_fix(r: dict, comps: dict, paths: dict, root: Path) -> dict:
+OSV_QUERY = "https://api.osv.dev/v1/query"
+_osv_cache: dict[tuple[str, str], list] = {}
+MAX_VETTED = 12  # candidate versions checked against OSV per route
+
+
+def serious_advisories(name: str, version: str) -> list[str]:
+    """High/critical (or malware) advisories OSV lists for name@version. Unknown on network errors -> []."""
+    key = (name, version)
+    if key not in _osv_cache:
+        try:
+            req = urllib.request.Request(OSV_QUERY, method="POST", headers={"Content-Type": "application/json",
+                                                                           "User-Agent": "supply-chain-guardian"},
+                                         data=json.dumps({"package": {"name": name, "ecosystem": "npm"},
+                                                          "version": version}).encode())
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                vulns = json.load(resp).get("vulns", [])
+            _osv_cache[key] = [v["id"] for v in vulns if v["id"].startswith("MAL-") or
+                               str((v.get("database_specific") or {}).get("severity", "")).upper() in ("HIGH", "CRITICAL")]
+        except Exception:
+            _osv_cache[key] = []
+    return _osv_cache[key]
+
+
+def routes_to(cid: str, edges: list, comps: dict) -> list[tuple[str, list[str]]]:
+    """Every (project, chain of component ids) from a package the project lists itself down to cid."""
+    fwd, back = {}, {}
+    for e in edges:
+        fwd.setdefault(e["source"], []).append(e["target"])
+        back.setdefault(e["target"], []).append(e["source"])
+    ancestors, todo = {cid}, [cid]
+    while todo:
+        for p in back.get(todo.pop(), []):
+            if p not in ancestors:
+                ancestors.add(p)
+                todo.append(p)
+    out = []
+    for proj in sorted(a for a in ancestors if a.startswith("project:")):
+        for d in sorted(set(fwd.get(proj, [])) & ancestors):
+            prev, queue = {d: None}, [d]  # shortest d -> cid inside the ancestor set
+            while queue and cid not in prev:
+                n = queue.pop(0)
+                for m in fwd.get(n, []):
+                    if m in ancestors and m not in prev:
+                        prev[m] = n
+                        queue.append(m)
+            if cid in prev:
+                chain, n = [], cid
+                while n is not None:
+                    chain.append(n)
+                    n = prev[n]
+                out.append((proj, chain[::-1]))
+    return out
+
+
+def find_safe(chain: list[str], current: Version, need: Version) -> tuple[Version | None, object, list, list]:
+    """Lowest version of chain[0] (>= current) whose resolution removes the vulnerable chain[-1] version and
+    whose resolved chain has no known high/critical advisory (checked with OSV). Returns
+    (version, resolved target or None if dropped, steps, advisories that made earlier candidates unsafe)."""
+    rejected, vetted = [], 0
+    for v in [v for v in stable_versions(chain[0]) if v >= current][:200]:
+        if len(chain) == 1:
+            t_new, steps = v, [{"package": chain[0], "version": str(v)}]
+            ok = v >= need
+        else:
+            t_new, steps = walk_chain(chain, v)
+            ok = t_new is None or (t_new is not False and t_new >= need)
+        if not ok:
+            continue
+        bad = [f"{s['package']}@{s['version']} {a}" for s in steps for a in serious_advisories(s["package"], s["version"])]
+        if not bad:
+            return v, t_new, steps, rejected
+        rejected.append({"version": str(v), "because": bad[:3]})
+        vetted += 1
+        if vetted >= MAX_VETTED:
+            break
+    return None, None, [], rejected
+
+
+def plan_fix(r: dict, comps: dict, paths: dict, root: Path, edges: list | None = None) -> dict:
     cid = r["component"]
     path = paths.get(cid) or []
-    chain_ids = path[2:] if len(path) > 2 else [cid]
-    chain = [comps[i]["name"] for i in chain_ids if i in comps]
-    project_path = path[1].removeprefix("project:") if len(path) > 1 else "."
     T, current_t = r["package"], ver(r["version"])
+    routes = routes_to(cid, edges or [], comps) or \
+        [(path[1] if len(path) > 1 else "project:.", path[2:] if len(path) > 2 else [cid])]
+    chains = [[comps[i]["name"] for i in ids if i in comps] for _, ids in routes]
     fixes = sorted({ver(a["fix"]) for a in r["advisories"] if a["fix"] and ver(a["fix"])})
     card = {"id": hashlib.sha1(f"fix|{cid}".encode()).hexdigest()[:12], "risk_id": r["id"], "rank": r["rank"],
             "package": T, "version": r["version"], "band": r["band"], "score_before": r["final_score"],
-            "chain": chain, "project": project_path, "evidence": {"registry": [REGISTRY + n for n in chain]}}
+            "chain": chains[0], "routes": [" → ".join(c) for c in chains],
+            "project": routes[0][0].removeprefix("project:"),
+            "evidence": {"registry": sorted({REGISTRY + n for c in chains for n in c})}}
     if not fixes:
         return {**card, "action": "replace", "title": f"No fixed version of {T} exists: replace or mitigate",
                 "advisories_removed": [], "cves_removed": [], "remaining": [a["id"] for a in r["advisories"]],
                 "score_after": r["final_score"], "change": None, "rollback": None, "patch": None}
     need = fixes[-1]
-    D = chain[0]
-    d_current = ver(comps[chain_ids[0]]["version"])
-    spec_from, field, manifest = manifest_spec(root, project_path, D)
-    candidate, steps = None, []
-    for v in [v for v in stable_versions(D) if v >= d_current][:200]:
-        if len(chain) == 1:
-            ok, t_new, steps = v >= need, v, [{"package": D, "version": str(v)}]
+
+    # one safe change per route (a vulnerable version can be pulled in by several of your packages)
+    changes, steps_all, t_afters, rejected, missing = [], [], [], [], []
+    for (proj, ids), chain in zip(routes, chains):
+        project_path = proj.removeprefix("project:")
+        D, d_current = chain[0], ver(comps[ids[0]]["version"])
+        spec_from, field, manifest = manifest_spec(root, project_path, D)
+        cand, t_new, steps, rej = find_safe(chain, d_current, need)
+        rejected += rej
+        if cand is None:
+            missing.append(D)
+            continue
+        steps_all.append(steps)
+        t_afters.append(need if len(chain) == 1 else t_new)
+        if cand == d_current and len(chain) > 1:  # the range you already have allows the fixed version
+            changes.append({"package": T, "from": r["version"], "to": str(t_new) if t_new else "removed",
+                            "spec_from": None, "spec_to": None, "field": "lockfile", "via": D,
+                            "manifest": manifest.replace("package.json", "package-lock.json"),
+                            "jump": jump(current_t, t_new) if current_t and t_new else "n/a"})
         else:
-            t_new, steps = walk_chain(chain, v)
-            ok = t_new is None or (t_new is not False and t_new >= need)
-        if ok:
-            candidate = v
-            break
-    if candidate is not None and candidate == d_current and len(chain) > 1:
-        t_after = t_new if t_new else None
-        change = {"package": T, "from": r["version"], "to": str(t_after) if t_after else "removed", "spec_from": None,
-                  "spec_to": None, "field": "lockfile", "manifest": manifest.replace("package.json", "package-lock.json"),
-                  "jump": jump(current_t, t_after) if current_t and t_after else "n/a"}
-        action = "relock"
-        title = (f"Refresh the lockfile: {D} {d_current} already allows {T} {t_after} (npm update {T})")
-        patch = f"npm update {T}   # rewrites package-lock.json only; package.json is unchanged"
-        rollback = {"version": r["version"], "how": "Restore the previous package-lock.json from git."}
-    elif candidate is not None:
-        t_after = need if len(chain) == 1 else (t_new if t_new else None)
-        spec_to = f"^{candidate}"
-        change = {"package": D, "from": str(d_current), "to": str(candidate), "spec_from": spec_from, "spec_to": spec_to,
-                  "field": field, "manifest": manifest, "jump": jump(d_current, candidate)}
-        action = "upgrade" if D == T else "upgrade-parent"
-        title = (f"Upgrade {D} {d_current} → {candidate}" + ("" if D == T else
-                 f" (pulls {T} {'out of the tree' if t_after is None else str(t_after)})"))
-        patch = f'--- {manifest}\n+++ {manifest}\n   "{field}": {{\n-    "{D}": "{spec_from}",\n+    "{D}": "{spec_to}",'
-        rollback = {"version": str(d_current), "how": f'Set "{D}": "{spec_from}" back in {manifest} and reinstall.'}
-    else:
-        t_after = need
+            changes.append({"package": D, "from": str(d_current), "to": str(cand), "spec_from": spec_from,
+                            "spec_to": f"^{cand}", "field": field, "manifest": manifest, "jump": jump(d_current, cand)})
+    note = (" Skipped versions with known high/critical advisories: "
+            + "; ".join(f"{x['version']} ({', '.join(x['because'])})" for x in rejected[:3])) if rejected else ""
+
+    if missing or not changes:
+        manifest = changes[0]["manifest"] if changes else manifest_spec(root, routes[0][0].removeprefix("project:"), T)[2]
+        manifest = manifest.replace("package-lock.json", "package.json")
+        bad = serious_advisories(T, str(need))
         change = {"package": T, "from": r["version"], "to": str(need), "spec_from": None, "spec_to": f"^{need}",
                   "field": "overrides", "manifest": manifest, "jump": jump(current_t, need) if current_t else "unknown"}
-        action, title = "override", f"Pin {T} to ^{need} with npm overrides (no {D} release pulls in a fixed {T})"
-        patch = f'--- {manifest}\n+++ {manifest}\n+  "overrides": {{\n+    "{T}": "^{need}"\n+  }},'
-        rollback = {"version": r["version"], "how": f'Remove the "{T}" entry from "overrides" in {manifest} and reinstall.'}
+        title = (f"Pin {T} to ^{need} with npm overrides (no safe release of {', '.join(missing) or 'its parent'} "
+                 f"pulls in a fixed {T})" + (f" - note: {T} {need} itself has {', '.join(bad)}" if bad else ""))
+        return finish(card, r, "override", title, [change], need, [], note,
+                      f'--- {manifest}\n+++ {manifest}\n+  "overrides": {{\n+    "{T}": "^{need}"\n+  }},',
+                      {"version": r["version"], "how": f'Remove the "{T}" entry from "overrides" in {manifest} and reinstall.'})
+
+    parts = [(f"refresh the lockfile so {c['via']} gets {T} {c['to']}" if c["field"] == "lockfile"
+              else f"{c['package']} {c['from']} → {c['to']}") for c in changes]
+    if len(changes) == 1 and changes[0]["field"] == "lockfile":
+        c = changes[0]
+        action, title = "relock", f"Refresh the lockfile: {c['via']} already allows {T} {c['to']} (npm update {T})"
+    elif len(changes) == 1:
+        c = changes[0]
+        action = "upgrade" if c["package"] == T else "upgrade-parent"
+        title = f"Upgrade {c['package']} {c['from']} → {c['to']}" + ("" if c["package"] == T else
+                f" (pulls {T} {'out of the tree' if t_afters[0] is None else t_afters[0]})")
+    else:
+        action = "upgrade-all"
+        title = f"Fix every route to {T} {r['version']} ({len(changes)} changes): " + "; ".join(parts)
+    patch = "\n".join(
+        f"npm update {T}   # lockfile only, via {c['via']}" if c["field"] == "lockfile" else
+        f'--- {c["manifest"]}\n+++ {c["manifest"]}\n   "{c["field"]}": {{\n-    "{c["package"]}": "{c["spec_from"]}",\n+    "{c["package"]}": "{c["spec_to"]}",'
+        for c in changes)
+    rollback = {"version": ", ".join(f"{c['package']} {c['from']}" for c in changes),
+                "how": "Put the previous versions back in package.json (and package-lock.json) from git and reinstall."}
+    real = [t for t in t_afters if t is not None]
+    t_after = min(real) if real else None
+    return finish(card, r, action, title + ("." if not note else ""), changes, t_after,
+                  [s for st in steps_all for s in st], note, patch, rollback)
+
+
+def finish(card, r, action, title, changes, t_after, steps, note, patch, rollback) -> dict:
     removed = [a for a in r["advisories"] if a["fix"] and (t_after is None or (ver(a["fix"]) and ver(a["fix"]) <= t_after))]
     remaining = [a for a in r["advisories"] if a not in removed]
     f = r["factors"]
     after = 0.0 if not remaining else round(min(10, max((a["cvss"] or 5.0) for a in remaining) * f["U"] * f["D"] * f["P"] * f["E"]), 1)
-    return {**card, "action": action, "title": title, "change": change, "patch": patch, "rollback": rollback,
-            "resolution": steps, "target_after": "removed from tree" if t_after is None else str(t_after),
+    return {**card, "action": action, "title": title, "change": changes[0], "changes": changes, "patch": patch,
+            "rollback": rollback, "resolution": steps, "vetting": note.strip(),
+            "target_after": "removed from tree" if t_after is None else str(t_after),
             "advisories_removed": [a["id"] for a in removed], "cves_removed": sorted({c for a in removed for c in a["cves"]}),
             "remaining": [a["id"] for a in remaining], "score_after": after, "band_after": band(after)}
 
@@ -211,7 +316,7 @@ def run(state: dict) -> tuple[dict, dict]:
     cards, errors = [], []
     for r in top:
         try:
-            card = plan_fix(r, comps, paths, root)
+            card = plan_fix(r, comps, paths, root, state.get("edges", []))
         except Exception as e:  # registry down etc.: keep going, say which card is missing
             errors.append({"package": r["package"], "error": f"{type(e).__name__}: {str(e)[:200]}"})
             continue
@@ -377,7 +482,8 @@ def merge_same_change(cards: list) -> list:
         if key and key in seen:
             first = seen[key]
             if upgrade and ver(ch["to"]) > ver(first["change"]["to"]):
-                for k in ("change", "patch", "resolution", "target_after", "title", "evidence", "usage_snippets", "ai",
+                for k in ("change", "changes", "routes", "vetting", "patch", "resolution", "target_after", "title",
+                          "evidence", "usage_snippets", "ai",
                           "compatibility", "plain"):
                     if k in c:
                         first[k] = c[k]

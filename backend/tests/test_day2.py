@@ -120,4 +120,21 @@ if __name__ == "__main__":
     assert row["final_score"] == 6.0 and "repo config" in row["labels"] and row["package"] == "x.yml:3"
     card = remediate.config_card(row, {"investigations": [cfg]})
     assert card["action"] == "config" and "digest" in card["title"] and card["score_after"] == 0.0
+    # Recommend Fix: every route to the vulnerable version, OSV-vetted candidates
+    edges = [{"source": "project:.", "target": "pkg:npm/jsonwebtoken@0.4.0"},
+             {"source": "project:.", "target": "pkg:npm/express-jwt@0.1.3"},
+             {"source": "pkg:npm/express-jwt@0.1.3", "target": "pkg:npm/jsonwebtoken@0.1.0"},
+             {"source": "pkg:npm/jsonwebtoken@0.4.0", "target": "pkg:npm/jws@0.2.6"},
+             {"source": "pkg:npm/jsonwebtoken@0.1.0", "target": "pkg:npm/jws@0.2.6"}]
+    routes = remediate.routes_to("pkg:npm/jws@0.2.6", edges, {})
+    assert sorted(r[1][0] for r in routes) == ["pkg:npm/express-jwt@0.1.3", "pkg:npm/jsonwebtoken@0.4.0"], routes
+    remediate._packuments.update({"express-jwt": {"versions": {
+        "0.1.3": {"dependencies": {"jsonwebtoken": "0.1.0"}}, "6.0.0": {"dependencies": {"jsonwebtoken": "^8.1.0"}},
+        "7.0.0": {"dependencies": {"jsonwebtoken": "^9.0.0"}}}},
+        "jsonwebtoken": {"versions": {"0.1.0": {}, "8.5.1": {}, "9.0.0": {}}}})
+    remediate._osv_cache.update({("express-jwt", "6.0.0"): [], ("jsonwebtoken", "8.5.1"): ["GHSA-8cf7-32gw-wr33"],
+                                 ("express-jwt", "7.0.0"): [], ("jsonwebtoken", "9.0.0"): []})
+    v, t, steps, rejected = remediate.find_safe(["express-jwt", "jsonwebtoken"], Version("0.1.3"), Version("5.0.0"))
+    assert str(v) == "7.0.0" and str(t) == "9.0.0", (v, t)          # 6.0.0 skipped: pulls jsonwebtoken 8.5.1 (high)
+    assert rejected and rejected[0]["version"] == "6.0.0" and "GHSA-8cf7-32gw-wr33" in rejected[0]["because"][0]
     print("day2 ok")
