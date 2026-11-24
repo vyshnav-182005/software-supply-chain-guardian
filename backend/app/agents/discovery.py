@@ -175,10 +175,18 @@ def npm_project(rel: str, pdir: Path, artifacts: Path, idx: int, components, edg
 REQ_LINE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?\s*(==\s*([^\s;#]+)|[<>=!~].*)?")
 
 
+def read_text_any(path: Path) -> str:
+    """Text in UTF-8 or UTF-16 (Windows PowerShell's `pip freeze > requirements.txt` writes UTF-16 with a BOM)."""
+    raw = path.read_bytes()
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16", errors="replace")
+    return raw.decode("utf-8-sig", errors="replace")
+
+
 def requirements_project(rel: str, path: Path, components, edges) -> dict:
     pid = f"project:{rel}"
     pinned = unpinned = 0
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in read_text_any(path).splitlines():
         m = REQ_LINE.match(line.strip())
         if not m or line.strip().startswith(("-", "#")):
             continue

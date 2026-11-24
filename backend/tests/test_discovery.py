@@ -23,4 +23,12 @@ if __name__ == "__main__":
     assert ("project:.", "pkg:npm/d@1.0.0", "dev") in edges
     assert comps["pkg:npm/a@1.0.0"]["direct"] and not comps["pkg:npm/b@2.0.0"]["direct"]
     assert comps["pkg:npm/d@1.0.0"]["scope"] == "dev" and comps["pkg:npm/c@1.0.0"]["install_script"]
+    # requirements.txt saved as UTF-16 (PowerShell `pip freeze > requirements.txt`) is still read
+    import tempfile
+    from pathlib import Path
+    from app.agents.discovery import requirements_project
+    f = Path(tempfile.mkdtemp()) / "requirements.txt"
+    f.write_text("flask==2.0.1\nrequests>=2\n", encoding="utf-16")
+    c16 = {}
+    assert requirements_project("x", f, c16, set())["component_count"] == 2 and "pkg:pypi/flask@2.0.1" in c16
     print("discovery ok")
