@@ -48,8 +48,10 @@ cd frontend; npm install; cd ..
 ```
 
 For AI explanations, copy `backend/.env.example` to `backend/.env` and set `GROQ_API_KEY`
-(optional: `GUARDIAN_LLM_MODEL`, `GITHUB_TOKEN`, `GUARDIAN_VALIDATE_TIMEOUT`, `GUARDIAN_ALLOW_UNSANDBOXED=1`).
-Validate builds and tests approved fixes in Docker: start Docker Desktop first, otherwise build/test is skipped and reported. Restart the backend after any change.
+(optional: `GUARDIAN_LLM_MODEL`, `GITHUB_TOKEN`, `GUARDIAN_VALIDATE_TIMEOUT`, `GUARDIAN_RUNNER`).
+Build, run & verify runs the fixed app **on this machine** by default (`GUARDIAN_RUNNER=local`: fast, but the
+repo's own code runs without a sandbox, so only for repos you trust). Set `GUARDIAN_RUNNER=docker` to use the
+Docker sandbox instead (start Docker Desktop first). Restart the backend after any change.
 
 Then, in two terminals (backend first):
 

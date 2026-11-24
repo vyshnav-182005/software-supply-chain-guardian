@@ -91,13 +91,14 @@ not reload by itself). The frontend reloads by itself; just refresh the page.
 | `GUARDIAN_OSV_OFFLINE=1` | Use OSV's offline database instead of the online API | online |
 | `GUARDIAN_VALIDATE_TIMEOUT` | Seconds allowed for build + tests when validating a fix | 1200 |
 | `GUARDIAN_FIX_DRYRUN=off` | Skip the npm compatibility check of fix cards during the scan (faster scans) | on |
-| `GUARDIAN_ALLOW_UNSANDBOXED=1` | If Docker is not running, run build/tests locally without a sandbox (runs the repo's code on your machine) | off |
+| `GUARDIAN_RUNNER` | `local`: Build, run & verify installs, builds, starts and tests the fixed app on this laptop (fast, reuses the npm/uv caches; the repo's own code runs **without a sandbox**, so only for repos you trust). `docker`: the same in the Docker sandbox (slower, isolated) | `local` |
+| `GUARDIAN_APP_PORT` | Port the fixed app is served on | 3001 |
 | `GUARDIAN_DATA_DIR` | Where clones, evidence files and the database are stored | `backend\data` |
 
 ### Tools the backend uses
 
-OSV-Scanner (required), Trivy (optional cross-check), npm and git. Validate needs **Docker Desktop
-running** to build and test fixes.
+OSV-Scanner (required), Trivy (optional cross-check), npm, uv and git. Docker Desktop is only needed with
+`GUARDIAN_RUNNER=docker`.
 
 ### How to run a demo (about 10 minutes)
 
@@ -469,8 +470,10 @@ Every approved fix is already applied to one copy of the project. **Build, run &
 
 1. **relock**: regenerates `package-lock.json` for all the applied fixes (no scripts run); for Python, checks
    with `uv` that the edited requirements still resolve;
-2. **build**: in Docker. Node: `npm ci` and `npm run build`. Python: a virtual environment in the copy
-   (`.guardian-venv`) and `pip install -r requirements.txt`. Network on for downloads;
+2. **build**: on this laptop by default (`GUARDIAN_RUNNER=local`), or in Docker (`GUARDIAN_RUNNER=docker`).
+   Node: `npm ci` (reusing the npm cache) and `npm run build`. Python: a fresh virtual environment in the copy
+   (`.guardian-venv`, made with uv) and the requirements installed into it. Locally the project's own code
+   runs without a sandbox: use it for repos you trust;
 3. **app check**: starts the app inside the sandbox (network off) and requests `GET /`. The start command is
    detected: Node `npm start` (port 3000); Python, in this order, the Procfile `web:` line, Django
    `manage.py runserver`, a FastAPI app with uvicorn, a Flask app, the Dockerfile `CMD` (port from `EXPOSE`,
@@ -485,8 +488,9 @@ Every approved fix is already applied to one copy of the project. **Build, run &
    package fix is undone (its card shows ↩ Rolled back with the log) and the rest is tried again
    (up to 3 times);
 6. **rescan** of the fixed copy with the same agents, and the comparison below;
-7. **run it for you**: the fixed app is started in Docker and published on **http://localhost:3001**.
-   **Open app** opens it in your browser; **Stop app** stops it.
+7. **run it for you**: the fixed app keeps running on **http://localhost:3001** (locally the app checked
+   in step 3 is simply left running; with Docker it is started in a container). **Open app** opens it in your
+   browser; **Stop app** stops it (locally the whole process tree is ended, on Windows too).
 
 **Result badge**: ✅ Fixed app runs, ⚠️ Built, app not confirmed, ❌ Build failed. A note appears if more
 fixes were approved after the last build ("build again to include them").

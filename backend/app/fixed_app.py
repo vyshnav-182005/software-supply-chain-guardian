@@ -24,11 +24,11 @@ from pathlib import Path
 
 from . import db
 from .agents.remediate import ver
-from .validate import (DOCKER, GIT_ID, NPM_BLAME, Step, _git, _rmtree, apply_change, apply_config,
+from .validate import (APP_PORT, DOCKER, GIT_ID, LOCAL_APPS, NPM_BLAME, Step, _git, _rmtree, apply_change,
+                       apply_config, runner_kind, stop_local,
                        build_and_test, detect_app, docker_ready, dry_run, explain_remaining, relock, rescan)
 
 FIXED = "fixed"           # validations-table key for the build/run record
-APP_PORT = 3001           # where the fixed app is published on the host
 MAX_ROLLBACKS = 3
 PACKAGE_ACTIONS = ("upgrade", "upgrade-parent", "upgrade-all", "relock", "override", "pin", "constrain")
 _lock = threading.Lock()  # one change to the fixed copy at a time
@@ -338,6 +338,11 @@ def _build(scan_id: str, rec: dict, step: Step) -> None:
         run = start_app(scan_id, root / build_res.get("project", projects[0]))
         rec["app"] = run
         step("run_app", "done" if run["running"] else "failed", run["detail"])
+    elif str(build_res.get("mode")).startswith("local") and smoke.get("status") == "passed":  # still running
+        url = smoke.get("url") or f"http://localhost:{APP_PORT}/"
+        rec["app"] = {"running": True, "url": url, "http_status": smoke.get("http_status"), "local": True,
+                      "detail": f"The fixed app is running on this machine at {url} ({smoke.get('command')})"}
+        step("run_app", "done", rec["app"]["detail"])
     smoke_ok = smoke.get("status") == "passed"
     if build_res.get("original_fails") and not smoke_ok:
         rec.update(status="original_fails", reason=f"{build_res['detail'].capitalize()}. See build-test-original.log.")
@@ -359,6 +364,7 @@ def original_build(root: Path, project: str, art: Path) -> dict:
         _git(root, "worktree", "add", "--detach", "-f", str(tmp), "guardian-original")
         return build_and_test(tmp / project, art, "build-test-original.log")
     finally:
+        stop_local(str(tmp.resolve()))
         try:
             _git(root, "worktree", "remove", "--force", str(tmp))
         except RuntimeError:
@@ -415,14 +421,21 @@ def start_app(scan_id: str, project: Path) -> dict:
 
 
 def stop_app(scan_id: str) -> bool:
-    if not DOCKER or not docker_ready():
+    if stop_local(str(workdir(scan_id).resolve())):
+        return True
+    if runner_kind() != "docker" or not DOCKER or not docker_ready():
         return False
     out = subprocess.run([DOCKER, "rm", "-f", container_name(scan_id)], capture_output=True, text=True, timeout=60)
     return out.returncode == 0
 
 
 def app_status(scan_id: str) -> dict:
-    if not DOCKER:
+    prefix = str(workdir(scan_id).resolve())
+    for key, p in LOCAL_APPS.items():
+        if key.startswith(prefix) and p.poll() is None:
+            rec = db.validations(scan_id).get(FIXED) or {}
+            return {"running": True, "url": (rec.get("app") or {}).get("url") or f"http://localhost:{APP_PORT}/"}
+    if runner_kind() != "docker" or not DOCKER:
         return {"running": False}
     out = subprocess.run([DOCKER, "inspect", "-f", "{{.State.Running}}", container_name(scan_id)],
                          capture_output=True, text=True, timeout=20)

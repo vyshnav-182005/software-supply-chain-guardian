@@ -80,9 +80,10 @@ export default function ValidationTab({ scanId, cards, validations, onRerun }: {
                 {fixed ? 'Build, run & verify again' : 'Build, run & verify fixed app'}</button>}
         </div>
         <p className="small muted">Every approved fix is applied to one copy of the project (branch <span className="mono">fix/guardian</span>;
-          the scanned original is untouched). This button installs, builds and starts that fixed copy in the Docker sandbox,
-          runs the tests, rescans it, and then runs the fixed app at <span className="mono">http://localhost:3001</span> for you
-          to open. {applied.length} fix{applied.length === 1 ? '' : 'es'} applied so far.</p>
+          the scanned original is untouched). This button installs, builds and starts that fixed copy, runs the tests, rescans it,
+          and leaves the fixed app running at <span className="mono">http://localhost:3001</span> for you to open. By default it
+          runs on this laptop (fast, but the project's own code runs without a sandbox: use it for repos you trust);
+          set <span className="mono">GUARDIAN_RUNNER=docker</span> in backend/.env to use the Docker sandbox instead. {applied.length} fix{applied.length === 1 ? '' : 'es'} applied so far.</p>
         {fixed?.outdated && <div className="note small">More fixes were applied after the last build: build again to include them.</div>}
         {fixed && <FixedResult v={fixed} scanId={scanId} onChange={onRerun} />}
       </section>
@@ -182,7 +183,8 @@ function FixedResult({ v, scanId, onChange }: { v: any; scanId: string; onChange
       {!app?.running && v.app && <div className="app-run bad small">{v.app.detail}</div>}
       {smoke && smoke.status && smoke.status !== 'not_applicable' && (
         <div className={`app-run ${smoke.status === 'passed' ? 'ok' : 'bad'} small`}>
-          <b>{smoke.status === 'passed' ? `App check in the sandbox: GET / → HTTP ${smoke.http_status}` : `App check: ${smoke.status}`}</b> {smoke.detail}
+          <b>{smoke.status === 'passed' ? `App check: GET / → HTTP ${smoke.http_status}` : `App check: ${smoke.status}`}</b> {smoke.detail}
+          {v.build?.mode?.startsWith('local') && <div className="muted">Ran on this laptop without a sandbox (GUARDIAN_RUNNER=local).</div>}
           {smoke.log_excerpt && <pre className="code">{smoke.log_excerpt}</pre>}
         </div>
       )}

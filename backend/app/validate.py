@@ -9,8 +9,8 @@ Starts in the background when a fix card is approved. The scanned clone is never
   4. build   Docker sandbox: `npm ci` and `npm run build` (network on: downloads, font inlining), then
              `npm test` with --network none; no secrets or host env, CPU/memory/time limits. A failure caused
              by the sandbox (no network, missing service or tool, out of memory) counts as "not tested".
-             Docker not running -> build/test is skipped (reported), unless GUARDIAN_ALLOW_UNSANDBOXED=1,
-             which runs the same commands locally with a cleaned environment, labelled "not sandboxed".
+             GUARDIAN_RUNNER=local (default) runs the same steps on this machine instead: faster, reuses
+             the npm/uv caches, but the project's own code runs without a sandbox (trusted repos only).
   5. rescan  Discovery, Dependency Graph, Container/CI, Vulnerabilities, Suspicious changes,
              Prioritize (rules only, no AI) on the fixed copy
   6. compare target advisories/finding gone? new advisories, packages or suspicious findings?
@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import threading
@@ -38,7 +39,13 @@ from .agents.discovery import NPM
 
 DOCKER = shutil.which("docker")
 TIMEOUT = int(os.environ.get("GUARDIAN_VALIDATE_TIMEOUT", "1200"))  # seconds for build + test together
-ALLOW_UNSANDBOXED = os.environ.get("GUARDIAN_ALLOW_UNSANDBOXED") == "1"
+APP_PORT = int(os.environ.get("GUARDIAN_APP_PORT", "3001"))  # where the fixed app is served for the person
+LOCAL_APPS: dict[str, subprocess.Popen] = {}  # local runner: resolved project dir -> running app process
+
+
+def runner_kind() -> str:
+    """GUARDIAN_RUNNER=local (default: on this machine, fast, no sandbox) or docker (sandboxed)."""
+    return "docker" if os.environ.get("GUARDIAN_RUNNER", "local").strip().lower() == "docker" else "local"
 _lock = threading.Lock()  # ponytail: one validation at a time (npm + rescans are heavy)
 CANCELLED: set[tuple[str, str]] = set()  # (scan, card) asked to stop; checked before each step
 
@@ -144,6 +151,7 @@ def _validate(scan_id: str, card_id: str, record: dict, step: Step) -> None:
     build = {"status": "not_applicable", "detail": "Configuration change: no package build to run"}
     if applied["kind"] == "package":  # build/test the project that holds the (first) change
         build = build_and_test(dst / applied["project"], art)
+        stop_local(str(dst.resolve()))  # a single-fix check does not leave the app running
     step("build_test", build["status"], build["detail"], mode=build.get("mode"), log=build.get("log"))
     if (build.get("smoke") or {}).get("status") in ("passed", "failed", "env_error"):
         step("app_smoke_test", build["smoke"]["status"], build["smoke"]["detail"], log=build.get("log"))
@@ -445,6 +453,8 @@ def detect_app(project: Path) -> dict:
         start = "npm start" if "start" in scripts else procfile.group(1).strip() if procfile else None
         return {"runtime": "node", "image": node_image(project), "port": SMOKE_PORT, "env": ["NODE_ENV=production"],
                 "install": ["npm", "ci", "--include=dev", "--no-audit", "--no-fund", "--legacy-peer-deps"],
+                "local_install": [[NPM, "ci", "--include=dev", "--prefer-offline", "--no-audit", "--no-fund",
+                                   "--legacy-peer-deps"]],
                 "build": ["npm", "run", "build"] if "build" in scripts else None,
                 "test": ["npm", "test"] if "test" in scripts else None, "probe": NODE_PROBE, "start": start,
                 "why": None if start else "No start script, Procfile web process or Dockerfile CMD"}
@@ -480,8 +490,135 @@ def detect_app(project: Path) -> dict:
     return {"runtime": "python", "image": f"python:{pyver}-slim", "port": port,
             "env": [f"VIRTUAL_ENV={VENV}", f"PATH={PY_PATH}", "PYTHONDONTWRITEBYTECODE=1", "PIP_DISABLE_PIP_VERSION_CHECK=1"],
             "install": ["sh", "-c", f"python -m venv {VENV} && {install}"], "build": None,
+            "local_install": _uv_install(pyver, ["-r", main.name] if main else ["."],
+                                         install.endswith("pip install -q uvicorn")),
             "test": ["python", "-m", "pytest", "-q"] if tests else None, "probe": PY_PROBE, "start": start,
             "why": None if start else "No Procfile, manage.py, FastAPI/Flask app or Dockerfile CMD found to start"}
+
+
+def _uv_install(pyver: str, pip_args: list[str], uvicorn: bool) -> list[list[str]] | None:
+    """Local runner: a fresh virtual environment in the project (.guardian-venv), filled by uv (fast, cached)."""
+    from .agents.pydeps import UV
+    if not UV:
+        return None
+    pip = [UV, "pip", "install", "-q", "--python", ".guardian-venv"]
+    return [[UV, "venv", "-q", "--allow-existing", "--python", pyver, ".guardian-venv"], [*pip, *pip_args],
+            *([[*pip, "uvicorn"]] if uvicorn else [])]
+
+
+def local_env(project: Path, plan: dict, ci: str, port: int) -> dict:
+    """The person's environment (PATH, npm/uv caches) without secrets, plus PORT; Python gets its venv first."""
+    env = {k: v for k, v in os.environ.items() if not re.search(r"KEY|TOKEN|SECRET|PASSWORD", k, re.I)}
+    env.update(CI=ci, PORT=str(port), BROWSER="none", PYTHONDONTWRITEBYTECODE="1")
+    if plan["runtime"] == "python":
+        venv = project / ".guardian-venv"
+        env.update(VIRTUAL_ENV=str(venv), PATH=f"{venv / ('Scripts' if os.name == 'nt' else 'bin')}{os.pathsep}{env.get('PATH', '')}")
+    return env
+
+
+def stop_local(prefix: str = "") -> bool:
+    """Stop local apps started from folders under `prefix` (whole process tree, Windows too)."""
+    hit = False
+    for key, p in list(LOCAL_APPS.items()):
+        if not key.startswith(prefix):
+            continue
+        if p.poll() is None:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, timeout=60)
+            else:
+                try:
+                    os.killpg(p.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            hit = True
+        LOCAL_APPS.pop(key, None)
+    return hit
+
+
+def start_local(project: Path, plan: dict, port: int, log_path: Path) -> dict:
+    """Start the app on this machine and wait (up to 3 minutes) for GET / to answer. It keeps running when it
+    answers below 500; otherwise it is stopped. Only one app at a time uses the port."""
+    import urllib.request
+    stop_local()  # ponytail: one app port, so a monorepo runs one project at a time
+    cmd = plan["start"].replace("${PORT}", str(port)).replace("$PORT", str(port))
+    log_f = open(log_path, "w", encoding="utf-8", errors="replace")
+    p = subprocess.Popen(cmd, shell=True, cwd=project, env=local_env(project, plan, "false", port), stdout=log_f,
+                         stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                         **({} if os.name == "nt" else {"start_new_session": True}))
+    LOCAL_APPS[str(project.resolve())] = p
+    url, status = f"http://localhost:{port}/", None
+    for _ in range(90):
+        time.sleep(2)
+        if p.poll() is not None:
+            break
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                status = r.status
+        except urllib.error.HTTPError as e:
+            status = e.code
+        except Exception:
+            continue
+        break
+    log_f.flush()
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    ok = status is not None and status < 500
+    if not ok:
+        stop_local(str(project.resolve()))
+    detail = (f"App started on this machine ({cmd}) and answered GET / with HTTP {status}" if ok else
+              f"The app exited ({cmd})" if p.poll() is not None else f"The app did not answer on port {port} in 3 minutes")
+    smoke = {"status": "passed" if ok else "failed", "http_status": status, "url": url, "command": cmd,
+             "log_excerpt": text[-1500:], "detail": detail}
+    env = None if ok else environment_problem(text)
+    if env:
+        smoke.update(status="env_error", detail=f"The app could not start on this machine: {env}")
+    return smoke
+
+
+def _local_build_and_test(project: Path, art: Path, log_name: str, plan: dict) -> dict:
+    """Local runner: install, build, start the app (left running on APP_PORT), tests. No sandbox."""
+    mode = "local (no sandbox)"
+    if not plan.get("local_install"):
+        return {"status": "skipped", "mode": mode, "smoke": {"status": "skipped", "detail": "uv is not installed"},
+                "detail": "uv is not installed, so the Python app was not installed or run (install uv)"}
+    py = plan["runtime"] == "python"
+    venv_py = str(project / ".guardian-venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
+    local = lambda cmd: [NPM if cmd[0] == "npm" else venv_py if py and cmd[0] == "python" else cmd[0], *cmd[1:]]
+    port = APP_PORT if plan["runtime"] == "node" or "PORT" in (plan["start"] or "") else plan["port"]
+    phases = [("install", c) for c in plan["local_install"]]
+    phases += [("build", local(plan["build"]))] if plan["build"] else []
+    phases += [("smoke", None)] if plan["start"] else []
+    phases += [("test", local(plan["test"]))] if plan["test"] else []
+    smoke = {"status": "not_applicable", "detail": f"{plan['why']}, so there is no app to start"}
+    log, deadline = [], time.time() + TIMEOUT
+    for name, cmd in phases:
+        left = deadline - time.time()
+        if left <= 0:
+            (art / log_name).write_text("\n".join(log), encoding="utf-8")
+            return {"status": "failed", "mode": mode, "log": log_name, "smoke": smoke, "detail": f"Timed out before '{name}'"}
+        if name == "smoke":
+            smoke = start_local(project, plan, port, art / f"app-{log_name}")
+            log.append(f"$ {smoke['command']} + GET {smoke['url']}  [app, on this machine]\n{smoke['log_excerpt']}")
+            (art / log_name).write_text("\n".join(log), encoding="utf-8")
+            continue  # tests still run, so their result is reported too
+        ci = "true" if name == "test" else "false"  # CI=true turns lint warnings into build errors (CRA)
+        try:
+            out = subprocess.run(cmd, cwd=project, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                 timeout=left, env=local_env(project, plan, ci, port), stdin=subprocess.DEVNULL)
+            text, code = f"{out.stdout[-20000:]}\n{out.stderr[-20000:]}", out.returncode
+        except subprocess.TimeoutExpired:
+            text, code = "(timed out)", "timeout"
+        log.append(f"$ {' '.join(map(str, cmd))}  [{name}, on this machine]\n{text}")
+        (art / log_name).write_text("\n".join(log), encoding="utf-8")
+        if code != 0:
+            env = environment_problem(text)
+            if env:
+                return {"status": "env_error", "mode": mode, "log": log_name, "smoke": smoke,
+                        "detail": f"'{name}' could not run on this machine ({code}): {env}"}
+            return {"status": "failed", "mode": mode, "log": log_name, "smoke": smoke, "phase": name,
+                    "detail": f"'{name}' failed ({code})"}
+    ran = ", ".join(dict.fromkeys(n for n, _ in phases if n != "smoke"))
+    return {"status": "passed", "mode": mode, "log": log_name, "smoke": smoke,
+            "detail": f"Passed: {ran}" + ("" if plan["test"] else " (no tests found)")}
 
 
 def build_and_test(project: Path, art: Path, log_name: str = "build-test.log") -> dict:
@@ -490,6 +627,8 @@ def build_and_test(project: Path, art: Path, log_name: str = "build-test.log") -
     if not plan["runtime"]:
         return {"status": "not_applicable", "detail": plan["why"],
                 "smoke": {"status": "not_applicable", "detail": plan["why"]}}
+    if runner_kind() == "local":
+        return _local_build_and_test(project, art, log_name, plan)
     phases = [("install", plan["install"], True)]
     # build may need the network (e.g. Angular inlines Google Fonts); the app and tests run with the network off
     phases += [("build", plan["build"], True)] if plan["build"] else []
@@ -506,18 +645,10 @@ def build_and_test(project: Path, art: Path, log_name: str = "build-test.log") -
             return [DOCKER, "run", "--rm", "--cpus", "2", "--memory", "4g", "--pids-limit", "512",
                     *([] if network else ["--network", "none"]), *env,
                     "-v", f"{project.resolve()}:/app", "-w", "/app", plan["image"], *cmd]
-    elif ALLOW_UNSANDBOXED and plan["runtime"] == "node":
-        mode = "local, NOT sandboxed"
-        phases = [p for p in phases if p[0] != "smoke"]
-        smoke = {"status": "skipped", "detail": "The app is only started inside the Docker sandbox"}
-
-        def runner(cmd, network, ci):
-            return [NPM if cmd[0] == "npm" else cmd[0], *cmd[1:]] + (["--ignore-scripts"] if cmd[1] == "ci" else [])
     else:
         return {"status": "skipped", "mode": "none", "smoke": {"status": "skipped", "detail": "Docker is not running"},
                 "detail": "Docker is not running, so the build, app start and tests were not run (start Docker "
-                          "Desktop" + (", or set GUARDIAN_ALLOW_UNSANDBOXED=1 to build and test locally without a "
-                                       "sandbox)." if plan["runtime"] == "node" else ").")}
+                          "Desktop, or remove GUARDIAN_RUNNER=docker from backend/.env to run them on this machine)."}
     log = []
     clean_env = {k: os.environ[k] for k in ("PATH", "SYSTEMROOT", "TEMP", "TMP", "COMSPEC", "PATHEXT") if k in os.environ}
     deadline = time.time() + TIMEOUT
@@ -594,6 +725,9 @@ ENV_PATTERNS = [
     (re.compile(r"ENOSPC|out of memory|JavaScript heap out of memory|Killed", re.I), "the sandbox ran out of resources"),
     (re.compile(r"got \d+ SIGTERM/SIGINTs|SIGTERM received|\(timed out\)"), "the build was stopped (backend restarted, "
      "cancelled or timed out), so it says nothing about the fixes"),
+    (re.compile(r"EADDRINUSE|address already in use|Only one usage of each socket address|"
+                r"Something is already running on port", re.I),
+     "the port is already in use (stop the other app, or an app left from before the backend restarted)"),
     (re.compile(r"OperationalError|could not connect to server|Connection refused|Can't connect to (MySQL|local)|"
                 r"SequelizeConnection", re.I), "a database the app needs is not running in the sandbox"),
     (re.compile(r"KeyError: '[A-Z][A-Z0-9_]+'|environment variable|ImproperlyConfigured|Missing required env|"

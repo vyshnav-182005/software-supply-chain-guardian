@@ -8,6 +8,7 @@ from pathlib import Path
 os.environ["GUARDIAN_DATA_DIR"] = tempfile.mkdtemp()
 os.environ["GROQ_API_KEY"] = ""
 os.environ["GUARDIAN_LLM_API_KEY"] = ""
+os.environ["GUARDIAN_RUNNER"] = "docker"  # with Docker faked off, build/test is skipped
 
 from app import db, report, validate  # noqa: E402
 
