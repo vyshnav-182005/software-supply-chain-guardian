@@ -73,8 +73,8 @@ function Card({ c, pkgs, scanId, decision, validation, onDecided }: { c: FixCard
         </div>
       </div>
 
-      {c.compat?.ok === false && <div className="alert small">npm cannot install this fix with the project's dependencies: {c.compat.reason}</div>}
-      {c.compat?.ok && <div className="small muted">✓ npm dry run: installs cleanly</div>}
+      {c.compat?.ok === false && <div className="alert small">The package manager cannot install this fix with the project's dependencies: {c.compat.reason}</div>}
+      {c.compat?.ok && <div className="small muted">✓ Dry run (npm or uv): installs cleanly</div>}
       <div className="explain">
         <div className="explain-label">{c.plain?.source === 'AI' ? 'AI explanation' : 'Explanation'}</div>
         <p>{c.plain?.text ?? ai?.summary ?? c.title}</p>
@@ -89,7 +89,7 @@ function Card({ c, pkgs, scanId, decision, validation, onDecided }: { c: FixCard
         ) : (
           <>
             <button className="approve" disabled={busy || c.action === 'replace' || c.compat?.ok === false}
-                    title={c.compat?.ok === false ? 'npm cannot install this fix with the project' : undefined}
+                    title={c.compat?.ok === false ? 'The package manager cannot install this fix with the project' : undefined}
                     onClick={() => decide('approved')}>Approve</button>
             <button className="reject" disabled={busy} onClick={() => decide('rejected')}>Reject</button>
           </>

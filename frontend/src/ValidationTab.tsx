@@ -5,7 +5,7 @@ import { artifactUrl } from './types'
 export const VSTATUS: Record<string, { label: string; cls: string }> = {
   // a fix card in the fixed copy
   applying: { label: 'Applying…', cls: 'unrated' },
-  checking: { label: 'Checking with npm…', cls: 'unrated' },
+  checking: { label: 'Checking the dependency tree…', cls: 'unrated' },
   conflicts: { label: '❌ Conflicts', cls: 'critical' },
   applied: { label: '✅ Applied', cls: 'low' },
   already_applied: { label: '✅ Already covered', cls: 'low' },

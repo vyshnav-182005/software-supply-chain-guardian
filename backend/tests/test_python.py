@@ -53,4 +53,52 @@ if __name__ == "__main__":
     pydeps._versions["jinja2"] = [Version(v) for v in ("3.1.3", "3.1.4", "3.1.5")]
     v, rej = pydeps.safe_version("jinja2", "3.1.2", "3.1.3", lambda n, ver: ["GHSA-x"] if ver == "3.1.3" else [])
     assert v == "3.1.4" and rej[0]["version"] == "3.1.3"
+
+    # fix card: direct -> ==safe, pulled in -> >=safe line; apply then undo through the fixed-app helpers
+    from app import fixed_app, validate
+    from app.agents import remediate
+    pydeps._versions["flask"] = [Version(v) for v in ("2.2.5", "2.3.3")]
+    pydeps._versions["werkzeug"] = [Version("3.0.6")]
+    remediate.serious_advisories = lambda n, v, eco="npm": []
+    risk = lambda name, direct: ({"id": "r", "rank": 1, "component": f"pkg:pypi/{name}", "band": "high", "final_score": 7.5,
+                                  "path": [name], "controlled_by": None, "factors": {"U": 1, "D": 1, "P": 1, "E": 1, "R": 1},
+                                  "advisories": [{"id": "GHSA-1", "cves": ["CVE-1"], "cvss": 7.5, "fix": "2.2.5" if direct else "3.0.6"}]},
+                                 {f"pkg:pypi/{name}": {"name": name, "version": "2.0.1" if direct else "2.0.3",
+                                                       "direct": direct, "projects": ["project:./requirements.txt"]}})
+    card = remediate.plan_fix_python(*risk("flask", True))
+    assert card["action"] == "upgrade" and card["change"]["spec_to"] == "==2.2.5" and card["score_after"] == 0.0, card
+    card2 = remediate.plan_fix_python(*risk("werkzeug", False))
+    assert card2["action"] == "constrain" and card2["change"]["spec_to"] == ">=3.0.6", card2
+    app_dir = Path(tempfile.mkdtemp())
+    (app_dir / "requirements.txt").write_text("flask==2.0.1\n", encoding="utf-8")
+    res = validate.apply_change(card, {}, app_dir)
+    res2 = validate.apply_change(card2, {}, app_dir)
+    assert res["ok"] and res2["ok"] and res["projects"] == ["."], res
+    assert (app_dir / "requirements.txt").read_text().splitlines()[:2] == ["flask==2.2.5", "werkzeug>=3.0.6  # added by Supply Chain Guardian (pins a pulled-in package)"]
+    fixed_app._undo(app_dir, {"changes": card2["changes"]})
+    fixed_app._undo(app_dir, {"changes": card["changes"]})
+    assert (app_dir / "requirements.txt").read_text() == "flask==2.0.1\n"
+
+    # app detection: start command and port for each kind of project
+    def proj(files):
+        p = Path(tempfile.mkdtemp())
+        for name, text in files.items():
+            (p / name).parent.mkdir(parents=True, exist_ok=True)
+            (p / name).write_text(text, encoding="utf-8")
+        return p
+    plan = validate.detect_app(proj({"requirements.txt": "flask\n", "app.py": "from flask import Flask\napp = Flask(__name__)\n"}))
+    assert plan["runtime"] == "python" and plan["start"] == "python -m flask --app app:app run --host 0.0.0.0 --port $PORT"
+    plan = validate.detect_app(proj({"requirements.txt": "fastapi\n", "src/main.py": "api = FastAPI()\n"}))
+    assert "uvicorn src.main:api" in plan["start"] and "pip install -q uvicorn" in plan["install"][2], plan
+    plan = validate.detect_app(proj({"requirements.txt": "django\npytest\n", "manage.py": "", "tests/x.py": "", ".python-version": "3.11.4"}))
+    assert "manage.py runserver" in plan["start"] and plan["test"] and plan["image"] == "python:3.11-slim", plan
+    plan = validate.detect_app(proj({"requirements.txt": "x\n", "Dockerfile": 'FROM python\nEXPOSE 5005\nCMD ["python", "serve.py"]\n'}))
+    assert plan["start"] == "python serve.py" and plan["port"] == 5005, plan
+    plan = validate.detect_app(proj({"requirements.txt": "x\n", "Procfile": "web: gunicorn app:app --bind 0.0.0.0:$PORT\n"}))
+    assert plan["start"].startswith("gunicorn"), plan
+    assert validate.detect_app(proj({"requirements.txt": "x\n"}))["start"] is None
+    assert validate.detect_app(proj({"package.json": '{"scripts": {"start": "node ."}}'}))["start"] == "npm start"
+    assert validate.detect_app(proj({"README.md": ""}))["runtime"] is None
+    assert validate.environment_problem("django.db.utils.OperationalError: could not connect to server")
+    assert validate.environment_problem("KeyError: 'SECRET_KEY'")
     print("python ok")

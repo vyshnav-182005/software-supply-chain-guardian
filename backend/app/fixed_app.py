@@ -24,13 +24,13 @@ from pathlib import Path
 
 from . import db
 from .agents.remediate import ver
-from .validate import (DOCKER, GIT_ID, NPM_BLAME, SMOKE_PORT, Step, _git, _rmtree, apply_change, apply_config,
-                       build_and_test, docker_ready, dry_run, explain_remaining, node_image, relock, rescan)
+from .validate import (DOCKER, GIT_ID, NPM_BLAME, Step, _git, _rmtree, apply_change, apply_config,
+                       build_and_test, detect_app, docker_ready, dry_run, explain_remaining, relock, rescan)
 
 FIXED = "fixed"           # validations-table key for the build/run record
 APP_PORT = 3001           # where the fixed app is published on the host
 MAX_ROLLBACKS = 3
-PACKAGE_ACTIONS = ("upgrade", "upgrade-parent", "upgrade-all", "relock", "override", "pin")
+PACKAGE_ACTIONS = ("upgrade", "upgrade-parent", "upgrade-all", "relock", "override", "pin", "constrain")
 _lock = threading.Lock()  # one change to the fixed copy at a time
 
 
@@ -65,7 +65,7 @@ def without_downgrades(card: dict, root: Path) -> tuple[dict, list]:
     kept, skipped = [], []
     for ch in card.get("changes") or ([card["change"]] if card.get("change") else []):
         manifest = root / ch["manifest"].replace("package-lock.json", "package.json")
-        if ch.get("field") in (None, "lockfile") or not manifest.is_file():
+        if ch.get("field") in (None, "lockfile", "requirements") or not manifest.is_file():
             kept.append(ch)
             continue
         data = json.loads(manifest.read_text(encoding="utf-8"))
@@ -159,6 +159,10 @@ def _undo(root: Path, val: dict) -> None:
         if ch.get("field") in (None, "lockfile"):
             continue  # lockfile-only fixes are undone by leaving them out of the next relock
         manifest = root / ch["manifest"].replace("package-lock.json", "package.json")
+        if ch.get("field") == "requirements":
+            from .agents import pydeps
+            pydeps.undo_requirements(manifest, ch["package"], ch.get("spec_from"))
+            continue
         data = json.loads(manifest.read_text(encoding="utf-8"))
         section = data.get(ch["field"]) or {}
         if ch["field"] == "overrides" or not ch.get("spec_from"):
@@ -227,8 +231,8 @@ def _build(scan_id: str, rec: dict, step: Step) -> None:
     for attempt in range(MAX_ROLLBACKS + 1):
         applied = _applied(scan_id, cards)
         pkg = [(c, v) for c, v in applied if v.get("kind") == "package"]
-        if not (root / "package.json").is_file() and not pkg:
-            break  # not a Node project: nothing to build or run
+        if not detect_app(root)["runtime"] and not pkg:
+            break  # no Node or Python project at the root and no package fix: nothing to build or run
         # always build and run the app, even with only config fixes left, to show it still works
         projects = sorted({p for _, v in pkg for p in v.get("projects") or ["."]}) or ["."]
         updates = [(proj, name) for _, v in pkg for proj, name in v.get("updates") or []]
@@ -257,8 +261,8 @@ def _build(scan_id: str, rec: dict, step: Step) -> None:
         _commit_tracked(root, "Guardian: regenerate lockfiles",
                         [f"{p}/package-lock.json".lstrip("./") or "package-lock.json" for p in projects
                          if (root / p / "package-lock.json").is_file()])
-        step("relock", "done", "Regenerated package-lock.json for all applied fixes", log="relock.log")
-        build_res = build_and_test(root / projects[0], art)
+        step("relock", "done", "Dependency tree resolves with all applied fixes", log="relock.log")
+        build_res = build_all(root, projects, art)
         broke = build_res["status"] == "failed" and build_res.get("phase") in ("install", "build")
         broke = broke or (build_res.get("smoke") or {}).get("status") == "failed"
         if not broke or not pkg:
@@ -319,7 +323,7 @@ def _build(scan_id: str, rec: dict, step: Step) -> None:
 
     # run the fixed app for the person to open
     if build_res.get("mode") == "docker sandbox" and smoke.get("status") == "passed":
-        run = start_app(scan_id, root / projects[0])
+        run = start_app(scan_id, root / build_res.get("project", projects[0]))
         rec["app"] = run
         step("run_app", "done" if run["running"] else "failed", run["detail"])
     smoke_ok = smoke.get("status") == "passed"
@@ -332,6 +336,23 @@ def _build(scan_id: str, rec: dict, step: Step) -> None:
         rec.update(status="built", reason=f"{build_res['detail']}. Advisories {len(before)} -> {len(after['vulnerabilities'])}.")
 
 
+def build_all(root: Path, projects: list[str], art: Path) -> dict:
+    """Monorepo: build every changed project (own log each). Report the first one that broke, else the
+    primary one: the first whose app starts (that is the one run for the person to open)."""
+    results = []
+    for i, p in enumerate(projects):
+        r = build_and_test(root / p, art, "build-test.log" if i == 0 else f"build-test-{i}.log")
+        r["project"] = p
+        results.append(r)
+        if (r["status"] == "failed" and r.get("phase") in ("install", "build")) or \
+                (r.get("smoke") or {}).get("status") == "failed":
+            return {**r, "detail": f"{p}: {r['detail']}" if len(projects) > 1 else r["detail"]}
+    primary = next((r for r in results if (r.get("smoke") or {}).get("status") == "passed"), results[0])
+    if len(results) > 1:
+        primary = {**primary, "detail": "; ".join(f"{r['project']}: {r['detail']}" for r in results)}
+    return primary
+
+
 def container_name(scan_id: str) -> str:
     return f"guardian-app-{scan_id}"
 
@@ -340,9 +361,13 @@ def start_app(scan_id: str, project: Path) -> dict:
     """Start the fixed app in Docker with its port published on the host, and wait for GET / to answer."""
     import urllib.request
     stop_app(scan_id)
+    plan = detect_app(project)
+    if not plan.get("start"):
+        return {"running": False, "detail": plan.get("why") or "No start command"}
+    env = [x for e in [f"PORT={plan['port']}", *plan["env"]] for x in ("-e", e)]
     cmd = [DOCKER, "run", "-d", "--name", container_name(scan_id), "--cpus", "2", "--memory", "4g",
-           "-p", f"{APP_PORT}:{SMOKE_PORT}", "-e", f"PORT={SMOKE_PORT}", "-e", "NODE_ENV=production",
-           "-v", f"{project.resolve()}:/app", "-w", "/app", node_image(project), "npm", "start"]
+           "-p", f"{APP_PORT}:{plan['port']}", *env,
+           "-v", f"{project.resolve()}:/app", "-w", "/app", plan["image"], "sh", "-c", plan["start"]]
     out = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
     if out.returncode:
         return {"running": False, "detail": f"docker run failed: {out.stderr.strip()[-300:]}"}

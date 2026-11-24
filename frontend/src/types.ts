@@ -128,7 +128,7 @@ export interface Risk {
 
 export interface FixCard {
   id: string; risk_id: string; rank: number; package: string; version: string; band: string
-  action: 'upgrade' | 'upgrade-parent' | 'upgrade-all' | 'relock' | 'override' | 'replace' | 'remove' | 'pin' | 'config'; title: string; also_fixes?: string[]
+  action: 'upgrade' | 'upgrade-parent' | 'upgrade-all' | 'relock' | 'override' | 'replace' | 'remove' | 'pin' | 'config' | 'constrain'; title: string; also_fixes?: string[]
   change: { package: string; from: string; to: string; spec_from: string | null; spec_to: string; field: string | null; manifest: string; jump: string } | null
   patch: string | null; rollback: { version: string; how: string } | null
   resolution?: { package: string; version: string; range?: string }[]; target_after?: string

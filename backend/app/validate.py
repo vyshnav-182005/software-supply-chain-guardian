@@ -184,7 +184,7 @@ def apply_change(card: dict, res: dict, root: Path) -> dict:
     """Apply every change on the card. A card can hold several (one per route that pulls in the
     vulnerable version, possibly in different projects); lockfile-only changes are applied by relock."""
     action = card["action"]
-    if action in ("upgrade", "upgrade-parent", "upgrade-all", "override", "pin", "relock"):
+    if action in ("upgrade", "upgrade-parent", "upgrade-all", "override", "pin", "relock", "constrain"):
         changes = card.get("changes") or ([card["change"]] if card.get("change") else [])
         details, diffs, projects, updates = [], [], [], []
         for ch in changes:
@@ -194,6 +194,14 @@ def apply_change(card: dict, res: dict, root: Path) -> dict:
             project = manifest.parent.relative_to(root).as_posix()
             if project not in projects:
                 projects.append(project)
+            if ch.get("field") == "requirements":  # Python: edit the requirements file, keep its encoding
+                from .agents import pydeps
+                before_txt = pydeps.read_text_any(manifest)
+                detail, previous = pydeps.edit_requirements(manifest, ch["package"], ch["spec_to"])
+                ch["spec_from"] = previous
+                details.append(f"{detail} in {ch['manifest']}")
+                diffs.append(_mini_diff(before_txt, pydeps.read_text_any(manifest), ch["manifest"]))
+                continue
             data = json.loads(manifest.read_text(encoding="utf-8"))
             before = json.dumps(data, indent=2)
             if not ch.get("field") and not ch.get("spec_from") and action not in ("override", "pin", "relock"):
@@ -322,8 +330,18 @@ def resolve_image_digest(image: str) -> str | None:
 # ---------------------------------------------------------------- 3. relock, 4. build + test
 
 def relock(project: Path, update: list[str]) -> tuple[bool, str]:
-    """Regenerate package-lock.json without running scripts; `update` = packages to move to the newest
-    version their existing ranges allow (lockfile-only fixes)."""
+    """npm: regenerate package-lock.json without running scripts; `update` = packages to move to the newest
+    version their ranges allow. Python: check that the requirements still resolve (uv, wheels only)."""
+    if not (project / "package.json").is_file():
+        from .agents import pydeps
+        reqs = sorted(project.glob("requirements*.txt"))
+        if not reqs:
+            return True, "no npm or requirements manifest to resolve\n"
+        log, ok = "", True
+        for r in reqs:
+            ok_r, out = pydeps.check_resolves(r)
+            ok, log = ok and ok_r, log + f"$ uv pip compile {r.name} --no-build\n{out}\n"
+        return ok, log
     base = ["--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"]
     cmds = [[NPM, "install", *base, "--package-lock=true"]] + ([[NPM, "update", *update, *base]] if update else [])
     log = ""
@@ -356,37 +374,138 @@ def node_image(project: Path) -> str:
 
 
 SMOKE_PORT = 3000
+VENV = "/app/.guardian-venv"
+PY_PATH = f"{VENV}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # Runs inside the container: start the app, poll http://127.0.0.1:PORT/ for up to ~3 minutes, print the
 # HTTP status and the end of the app log, then exit (the container is removed, so the app stops).
 SMOKE_SCRIPT = (
-    "npm start > /tmp/app.log 2>&1 & "
-    "for i in $(seq 1 90); do sleep 2; "
-    "node -e \"require('http').get('http://127.0.0.1:'+process.env.PORT+'/',r=>{console.log('HTTP '+r.statusCode);"
-    "process.exit(r.statusCode<500?0:1)}).on('error',()=>process.exit(2))\" "
-    "&& { echo '--- app log ---'; tail -n 15 /tmp/app.log; exit 0; }; done; "
+    "({start}) > /tmp/app.log 2>&1 & "
+    "for i in $(seq 1 90); do sleep 2; {probe} "
+    "&& {{ echo '--- app log ---'; tail -n 15 /tmp/app.log; exit 0; }}; done; "
     "echo 'App did not answer on port '$PORT; echo '--- app log ---'; tail -n 40 /tmp/app.log; exit 1"
 )
+NODE_PROBE = ("node -e \"require('http').get('http://127.0.0.1:'+process.env.PORT+'/',r=>{console.log('HTTP '+r.statusCode);"
+              "process.exit(r.statusCode<500?0:1)}).on('error',()=>process.exit(2))\"")
+PY_PROBE = ("python -c \"import os,sys,urllib.request as u,urllib.error as e\n"
+            "try: r=u.urlopen('http://127.0.0.1:'+os.environ['PORT']+'/',timeout=5); c=r.status\n"
+            "except e.HTTPError as x: c=x.code\n"
+            "except Exception: sys.exit(2)\n"
+            "print('HTTP',c); sys.exit(0 if c<500 else 1)\"")
 
 
-def build_and_test(project: Path, art: Path) -> dict:
+def _read(p: Path) -> str:
+    try:
+        return p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def dockerfile_start(project: Path) -> tuple[str | None, int | None]:
+    """CMD/ENTRYPOINT and EXPOSE of the project's Dockerfile (last ones win), as a shell command."""
+    text = _read(project / "Dockerfile")
+    cmd, port = None, None
+    for line in re.sub(r"\\\n", " ", text).splitlines():
+        m = re.match(r"\s*(CMD|ENTRYPOINT|EXPOSE)\s+(.+)", line, re.I)
+        if not m:
+            continue
+        kind, arg = m.group(1).upper(), m.group(2).strip()
+        if kind == "EXPOSE":
+            p = re.match(r"(\d+)", arg)
+            port = int(p.group(1)) if p else port
+            continue
+        try:
+            parts = json.loads(arg)
+            arg = " ".join(parts) if isinstance(parts, list) else arg
+        except ValueError:
+            pass
+        cmd = arg
+    return cmd, port
+
+
+def _py_app(project: Path, pattern: str) -> str | None:
+    """'module:variable' of the first top-level-ish .py file that creates the app (FastAPI(...) / Flask(...))."""
+    rx = re.compile(rf"^(\w+)\s*=\s*{pattern}\(", re.M)
+    files = sorted(project.glob("*.py")) + sorted(project.glob("*/*.py")) + sorted(project.glob("*/*/*.py"))
+    for f in files:
+        if any(part.startswith(".") or part in ("tests", "test", "venv") for part in f.relative_to(project).parts):
+            continue
+        m = rx.search(_read(f))
+        if m:
+            return ".".join(f.relative_to(project).with_suffix("").parts) + ":" + m.group(1)
+    return None
+
+
+def detect_app(project: Path) -> dict:
+    """How to install, build, start and test the project in a sandbox. Node (package.json) or Python
+    (requirements*.txt / pyproject.toml). start=None means there is no app to start, with `why`."""
+    if (project / "package.json").is_file():
+        scripts = json.loads((project / "package.json").read_text(encoding="utf-8")).get("scripts") or {}
+        procfile = re.search(r"^web:\s*(.+)$", _read(project / "Procfile"), re.M)
+        start = "npm start" if "start" in scripts else procfile.group(1).strip() if procfile else None
+        return {"runtime": "node", "image": node_image(project), "port": SMOKE_PORT, "env": ["NODE_ENV=production"],
+                "install": ["npm", "ci", "--no-audit", "--no-fund", "--legacy-peer-deps"],
+                "build": ["npm", "run", "build"] if "build" in scripts else None,
+                "test": ["npm", "test"] if "test" in scripts else None, "probe": NODE_PROBE, "start": start,
+                "why": None if start else "No start script, Procfile web process or Dockerfile CMD"}
+    reqs = sorted(project.glob("requirements*.txt"))
+    pyproject = _read(project / "pyproject.toml")
+    if not reqs and "[project]" not in pyproject and not (project / "manage.py").is_file():
+        return {"runtime": None, "start": None, "why": "No package.json, requirements.txt or pyproject.toml here"}
+    from .agents import pydeps
+    main = next((r for r in reqs if r.name == "requirements.txt"), reqs[0] if reqs else None)
+    install = (f"pip install -q -r {main.name}" if main else "pip install -q .")
+    req_text = " ".join(pydeps.read_text_any(r).lower() for r in reqs) + pyproject.lower()
+    port = 8000
+    procfile = re.search(r"^web:\s*(.+)$", _read(project / "Procfile"), re.M)
+    docker_cmd, docker_port = dockerfile_start(project)
+    fastapi, flask = _py_app(project, r"FastAPI"), _py_app(project, r"Flask")
+    if procfile:
+        start = procfile.group(1).strip()
+    elif (project / "manage.py").is_file():
+        start = "python manage.py runserver 0.0.0.0:$PORT --noreload"
+    elif fastapi:
+        start = f"python -m uvicorn {fastapi} --host 0.0.0.0 --port $PORT"
+        if "uvicorn" not in req_text:  # the app needs a server the requirements do not list
+            install += " && pip install -q uvicorn"
+    elif flask:
+        start = f"python -m flask --app {flask} run --host 0.0.0.0 --port $PORT"
+    elif docker_cmd:
+        start, port = docker_cmd, docker_port or port
+    else:
+        start = None
+    tests = "pytest" in req_text and any((project / n).exists() for n in ("tests", "test", "pytest.ini", "conftest.py"))
+    pyver = pydeps.python_version_for(project) or "3.12"
+    pyver = ".".join(pyver.split(".")[:2])
+    return {"runtime": "python", "image": f"python:{pyver}-slim", "port": port,
+            "env": [f"VIRTUAL_ENV={VENV}", f"PATH={PY_PATH}", "PYTHONDONTWRITEBYTECODE=1", "PIP_DISABLE_PIP_VERSION_CHECK=1"],
+            "install": ["sh", "-c", f"python -m venv {VENV} && {install}"], "build": None,
+            "test": ["python", "-m", "pytest", "-q"] if tests else None, "probe": PY_PROBE, "start": start,
+            "why": None if start else "No Procfile, manage.py, FastAPI/Flask app or Dockerfile CMD found to start"}
+
+
+def build_and_test(project: Path, art: Path, log_name: str = "build-test.log") -> dict:
     """install -> build -> app smoke test -> tests. Returns {status, detail, mode, log, smoke}."""
-    scripts = json.loads((project / "package.json").read_text(encoding="utf-8")).get("scripts") or {}
-    phases = [("install", ["npm", "ci", "--no-audit", "--no-fund", "--legacy-peer-deps"], True)]
+    plan = detect_app(project)
+    if not plan["runtime"]:
+        return {"status": "not_applicable", "detail": plan["why"],
+                "smoke": {"status": "not_applicable", "detail": plan["why"]}}
+    phases = [("install", plan["install"], True)]
     # build may need the network (e.g. Angular inlines Google Fonts); the app and tests run with the network off
-    phases += [(n, ["npm", "run", n], True) for n in ("build",) if n in scripts]
-    phases += [("smoke", ["sh", "-c", SMOKE_SCRIPT], False)] if "start" in scripts else []
-    phases += [("test", ["npm", "test"], False)] if "test" in scripts else []
-    log_name, log = "build-test.log", []
-    smoke = {"status": "not_applicable", "detail": "No start script, so there is no app to start"}
+    phases += [("build", plan["build"], True)] if plan["build"] else []
+    smoke_cmd = SMOKE_SCRIPT.format(start=plan["start"], probe=plan["probe"]) if plan["start"] else None
+    phases += [("smoke", ["sh", "-c", smoke_cmd], False)] if smoke_cmd else []
+    phases += [("test", plan["test"], False)] if plan["test"] else []
+    smoke = {"status": "not_applicable", "detail": f"{plan['why']}, so there is no app to start"}
+    port = plan["port"]
     if docker_ready():
         mode = "docker sandbox"
-        image = node_image(project)
 
         def runner(cmd, network):
+            env = [x for e in ["CI=true", f"PORT={port}", *plan["env"]] for x in ("-e", e)]
             return [DOCKER, "run", "--rm", "--cpus", "2", "--memory", "4g", "--pids-limit", "512",
-                    *([] if network else ["--network", "none"]), "-e", "CI=true", "-e", f"PORT={SMOKE_PORT}",
-                    "-e", "NODE_ENV=production", "-v", f"{project.resolve()}:/app", "-w", "/app", image, *cmd]
-    elif ALLOW_UNSANDBOXED:
+                    *([] if network else ["--network", "none"]), *env,
+                    "-v", f"{project.resolve()}:/app", "-w", "/app", plan["image"], *cmd]
+    elif ALLOW_UNSANDBOXED and plan["runtime"] == "node":
         mode = "local, NOT sandboxed"
         phases = [p for p in phases if p[0] != "smoke"]
         smoke = {"status": "skipped", "detail": "The app is only started inside the Docker sandbox"}
@@ -396,7 +515,9 @@ def build_and_test(project: Path, art: Path) -> dict:
     else:
         return {"status": "skipped", "mode": "none", "smoke": {"status": "skipped", "detail": "Docker is not running"},
                 "detail": "Docker is not running, so the build, app start and tests were not run (start Docker "
-                          "Desktop, or set GUARDIAN_ALLOW_UNSANDBOXED=1 to build and test locally without a sandbox)."}
+                          "Desktop" + (", or set GUARDIAN_ALLOW_UNSANDBOXED=1 to build and test locally without a "
+                                       "sandbox)." if plan["runtime"] == "node" else ").")}
+    log = []
     clean_env = {k: os.environ[k] for k in ("PATH", "SYSTEMROOT", "TEMP", "TMP", "COMSPEC", "PATHEXT") if k in os.environ}
     deadline = time.time() + TIMEOUT
     for name, cmd, network in phases:
@@ -412,16 +533,16 @@ def build_and_test(project: Path, art: Path) -> dict:
             code = out.returncode
         except subprocess.TimeoutExpired:
             text, code = "(timed out)", "timeout"
-        shown = "npm start + GET /" if name == "smoke" else " ".join(cmd)
+        shown = f"{plan['start']} + GET /" if name == "smoke" else " ".join(cmd)
         log.append(f"$ {shown}  [{name}, network {'on' if network else 'off'}]\n{text}")
         (art / log_name).write_text("\n".join(log), encoding="utf-8")
         if name == "smoke":
             m = re.search(r"HTTP (\d{3})", text)
             excerpt = text.split("--- app log ---", 1)[-1].strip()[-1500:]
             smoke = {"status": "passed" if code == 0 else "failed", "http_status": int(m.group(1)) if m else None,
-                     "url": f"http://127.0.0.1:{SMOKE_PORT}/", "log_excerpt": excerpt,
-                     "detail": f"App started and answered GET / with HTTP {m.group(1)}" if code == 0 and m else
-                               "The app did not start or did not answer on port 3000"}
+                     "url": f"http://127.0.0.1:{port}/", "log_excerpt": excerpt, "command": plan["start"],
+                     "detail": f"App started ({plan['start']}) and answered GET / with HTTP {m.group(1)}"
+                               if code == 0 and m else f"The app did not start or did not answer on port {port}"}
             if code != 0:
                 env = environment_problem(text)
                 smoke["status"] = "env_error" if env else "failed"
@@ -437,7 +558,7 @@ def build_and_test(project: Path, art: Path) -> dict:
                     "detail": f"'{name}' failed ({code})"}
     ran = ", ".join(n for n, _, _ in phases if n != "smoke")
     return {"status": "passed", "mode": mode, "log": log_name, "smoke": smoke,
-            "detail": f"Passed: {ran}" + ("" if "test" in scripts else " (no test script)")}
+            "detail": f"Passed: {ran}" + ("" if plan["test"] else " (no tests found)")}
 
 
 def outcome(fixed: bool, new_risk: list, build: dict) -> tuple[str, str]:
@@ -469,6 +590,10 @@ ENV_PATTERNS = [
     (re.compile(r"ChromeHeadless|CHROME_BIN|No binary for Chrome|Cannot start Chrome|Failed to launch the browser", re.I),
      "the tests need a browser (Chrome) that the sandbox image does not have"),
     (re.compile(r"ENOSPC|out of memory|JavaScript heap out of memory|Killed", re.I), "the sandbox ran out of resources"),
+    (re.compile(r"OperationalError|could not connect to server|Connection refused|Can't connect to (MySQL|local)|"
+                r"SequelizeConnection", re.I), "a database the app needs is not running in the sandbox"),
+    (re.compile(r"KeyError: '[A-Z][A-Z0-9_]+'|environment variable|ImproperlyConfigured|Missing required env|"
+                r"is not set|must be set", re.I), "the app needs environment variables or secrets that are not set"),
 ]
 
 
@@ -606,15 +731,18 @@ def dry_run(card: dict, src_root: Path) -> dict:
     import tempfile
     changes = card.get("changes") or ([card["change"]] if card.get("change") else [])
     projects = sorted({Path(ch["manifest"].replace("package-lock.json", "package.json")).parent.as_posix() for ch in changes})
-    if not projects or card["action"] not in ("upgrade", "upgrade-parent", "upgrade-all", "relock", "override", "pin"):
+    if not projects or card["action"] not in ("upgrade", "upgrade-parent", "upgrade-all", "relock", "override", "pin",
+                                               "constrain"):
         return {"ok": True, "reason": "no package change", "blamed": [], "log": ""}
     tmp = Path(tempfile.mkdtemp(prefix="guardian-dry-"))
     try:
         for proj in projects:
             (tmp / proj).mkdir(parents=True, exist_ok=True)
-            for name in ("package.json", "package-lock.json", ".npmrc"):
-                if (src_root / proj / name).is_file():
-                    shutil.copy(src_root / proj / name, tmp / proj / name)
+            for f in (src_root / proj).iterdir():  # npm and Python manifests of that project
+                if f.is_file() and (f.name in ("package.json", "package-lock.json", ".npmrc", "pyproject.toml",
+                                               ".python-version", "runtime.txt") or
+                                    (f.name.startswith(("requirements", "constraints")) and f.suffix == ".txt")):
+                    shutil.copy(f, tmp / proj / f.name)
         applied = apply_change(copy.deepcopy(card), {}, tmp)
         if not applied["ok"]:
             return {"ok": False, "reason": applied["detail"], "blamed": [], "log": ""}

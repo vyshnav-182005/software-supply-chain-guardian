@@ -121,7 +121,7 @@ if __name__ == "__main__":
 
     calls = {"n": 0}
 
-    def fake_build(project, art):
+    def fake_build(project, art, log_name="build-test.log"):
         calls["n"] += 1
         if calls["n"] == 1:  # the first build breaks: the latest package fix must be rolled back
             return {"status": "failed", "phase": "build", "detail": "'build' failed (1)", "mode": "docker sandbox", "smoke": {}}

@@ -144,14 +144,14 @@ _osv_cache: dict[tuple[str, str], list] = {}
 MAX_VETTED = 12  # candidate versions checked against OSV per route
 
 
-def serious_advisories(name: str, version: str) -> list[str]:
+def serious_advisories(name: str, version: str, ecosystem: str = "npm") -> list[str]:
     """High/critical (or malware) advisories OSV lists for name@version. Unknown on network errors -> []."""
-    key = (name, version)
+    key = (ecosystem, name, version)
     if key not in _osv_cache:
         try:
             req = urllib.request.Request(OSV_QUERY, method="POST", headers={"Content-Type": "application/json",
                                                                            "User-Agent": "supply-chain-guardian"},
-                                         data=json.dumps({"package": {"name": name, "ecosystem": "npm"},
+                                         data=json.dumps({"package": {"name": name, "ecosystem": ecosystem},
                                                           "version": version}).encode())
             with urllib.request.urlopen(req, timeout=30) as resp:
                 vulns = json.load(resp).get("vulns", [])
@@ -297,6 +297,63 @@ def plan_fix(r: dict, comps: dict, paths: dict, root: Path, edges: list | None =
                   [s for st in steps_all for s in st], note, patch, rollback)
 
 
+def plan_fix_python(r: dict, comps: dict) -> dict:
+    """Python: raise a direct requirement to the lowest safe version (name==safe), or, for a package that
+    is pulled in, add a `name>=safe` line to the requirements file (pip/uv treat it as a constraint)."""
+    from packaging.version import InvalidVersion, Version
+
+    from . import pydeps
+    cid, c = r["component"], comps[r["component"]]
+    T, current = c["name"], c["version"]
+    manifest = c["projects"][0].removeprefix("project:").removeprefix("./")
+    card = {"id": hashlib.sha1(f"fix|{cid}".encode()).hexdigest()[:12], "risk_id": r["id"], "rank": r["rank"],
+            "package": T, "version": current, "band": r["band"], "score_before": r["final_score"], "chain": [T],
+            "routes": [" → ".join(r.get("path") or [T])], "project": str(Path(manifest).parent),
+            "evidence": {"registry": [f"https://pypi.org/project/{T}/"]}}
+
+    def pv(x):
+        try:
+            return Version(str(x))
+        except InvalidVersion:
+            return None
+    fixes = sorted({pv(a["fix"]) for a in r["advisories"] if a.get("fix") and pv(a["fix"])})
+    if not fixes:
+        return {**card, "action": "replace", "title": f"No fixed version of {T} exists: replace or mitigate",
+                "advisories_removed": [], "cves_removed": [], "remaining": [a["id"] for a in r["advisories"]],
+                "score_after": r["final_score"], "change": None, "rollback": None, "patch": None}
+    if manifest.endswith("pyproject.toml"):
+        return {**card, "action": "replace", "change": None, "rollback": None, "patch": None,
+                "title": f"Raise {T} to >= {fixes[-1]} in pyproject.toml (edit by hand)",
+                "advisories_removed": [], "cves_removed": [], "remaining": [a["id"] for a in r["advisories"]],
+                "score_after": r["final_score"]}
+    to, rejected = pydeps.safe_version(T, current, str(fixes[-1]), lambda n, v: serious_advisories(n, v, "PyPI"))
+    if to is None:
+        return {**card, "action": "replace", "change": None, "rollback": None, "patch": None,
+                "title": f"No safe release of {T} >= {fixes[-1]} without a known high/critical advisory",
+                "advisories_removed": [], "cves_removed": [], "remaining": [a["id"] for a in r["advisories"]],
+                "score_after": r["final_score"], "vetting": "; ".join(x["version"] for x in rejected)}
+    a_, b_ = pv(current), pv(to)
+    jmp = "unknown" if not (a_ and b_) else "major" if b_.major != a_.major else "minor" if b_.minor != a_.minor else "patch"
+    direct = c["direct"]
+    spec = f"=={to}" if direct else f">={to}"
+    change = {"package": T, "from": current, "to": to, "spec_from": None, "spec_to": spec, "field": "requirements",
+              "manifest": manifest, "jump": jmp}
+    title = (f"Upgrade {T} {current} → {to} in {manifest}" if direct else
+             f"Require {T} >= {to} in {manifest} (pulled in by {r.get('controlled_by') or 'another package'})")
+    note = ("Skipped versions with known high/critical advisories: " +
+            "; ".join(x["version"] for x in rejected[:3])) if rejected else ""
+    removed = [a for a in r["advisories"] if a.get("fix") and pv(a["fix"]) and pv(a["fix"]) <= b_]
+    remaining = [a for a in r["advisories"] if a not in removed]
+    f = r["factors"]
+    after = 0.0 if not remaining else round(min(10, max((a["cvss"] or 5.0) for a in remaining) * f["U"] * f["D"] * f["P"] * f["E"]), 1)
+    return {**card, "action": "upgrade" if direct else "constrain", "title": title, "change": change, "changes": [change],
+            "patch": f"--- {manifest}\n+++ {manifest}\n{'-' + T + '==' + current if direct else ''}\n+{T}{spec}",
+            "rollback": {"version": current, "how": f"Put the previous line for {T} back in {manifest}."},
+            "resolution": [], "vetting": note, "target_after": to,
+            "advisories_removed": [a["id"] for a in removed], "cves_removed": sorted({x for a in removed for x in a["cves"]}),
+            "remaining": [a["id"] for a in remaining], "score_after": after, "band_after": band(after)}
+
+
 def finish(card, r, action, title, changes, t_after, steps, note, patch, rollback) -> dict:
     removed = [a for a in r["advisories"] if a["fix"] and (t_after is None or (ver(a["fix"]) and ver(a["fix"]) <= t_after))]
     remaining = [a for a in r["advisories"] if a not in removed]
@@ -318,7 +375,10 @@ def run(state: dict) -> tuple[dict, dict]:
     cards, errors = [], []
     for r in top:
         try:
-            card = plan_fix(r, comps, paths, root, state.get("edges", []))
+            if comps.get(r["component"], {}).get("ecosystem") == "pypi":
+                card = plan_fix_python(r, comps)
+            else:
+                card = plan_fix(r, comps, paths, root, state.get("edges", []))
         except Exception as e:  # registry down etc.: keep going, say which card is missing
             errors.append({"package": r["package"], "error": f"{type(e).__name__}: {str(e)[:200]}"})
             continue
@@ -335,7 +395,8 @@ def run(state: dict) -> tuple[dict, dict]:
         ch = card.get("change")
         if ch and card["action"] != "replace":
             try:  # one odd version or a registry hiccup must not fail the whole scan
-                notes, source = changelog(ch["package"], ver(str(ch["from"])), ver(str(ch["to"])))
+                notes, source = (changelog(ch["package"], ver(str(ch["from"])), ver(str(ch["to"])))
+                             if ch.get("field") != "requirements" else ("", "PyPI package: changelog not fetched"))
             except Exception as e:
                 notes, source = "", f"changelog unavailable ({type(e).__name__})"
             card["evidence"]["changelog"] = source
@@ -466,7 +527,8 @@ def check_compatibility(cards: list, root: Path) -> int:
     from concurrent.futures import ThreadPoolExecutor
 
     from ..validate import dry_run
-    todo = [c for c in cards if c["action"] in ("upgrade", "upgrade-parent", "upgrade-all", "relock", "override", "pin")]
+    todo = [c for c in cards if c["action"] in ("upgrade", "upgrade-parent", "upgrade-all", "relock", "override", "pin",
+                                                 "constrain")]
     if not DRY_RUN or not todo:
         return 0
     with ThreadPoolExecutor(max_workers=4) as pool:

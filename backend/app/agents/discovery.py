@@ -24,7 +24,7 @@ from pathlib import Path
 from . import pydeps
 from urllib.parse import quote, urlparse
 
-SKIP_DIRS = {"node_modules", ".git", "vendor", "dist", "build", ".venv", "venv", "__pycache__"}
+SKIP_DIRS = {"node_modules", ".git", "vendor", "dist", "build", ".venv", "venv", "__pycache__", ".guardian-venv"}
 UNSUPPORTED = {
     "Pipfile": "pypi", "poetry.lock": "pypi", "Pipfile.lock": "pypi",
     "pom.xml": "maven", "build.gradle": "maven", "build.gradle.kts": "maven",
