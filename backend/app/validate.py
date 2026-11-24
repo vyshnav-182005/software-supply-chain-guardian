@@ -6,8 +6,9 @@ Starts in the background when a fix card is approved. The scanned clone is never
   2. apply   the card's exact change: package.json version, npm "overrides" pin, lockfile refresh,
              GitHub Action -> commit SHA, base image -> digest, npm install -> npm ci, trigger fix
   3. relock  npm install --package-lock-only --ignore-scripts (package changes only)
-  4. build   Docker sandbox: `npm ci` (network on, to download), then `npm run build` and `npm test`
-             with --network none, no secrets or host env, CPU/memory/time limits.
+  4. build   Docker sandbox: `npm ci` and `npm run build` (network on: downloads, font inlining), then
+             `npm test` with --network none; no secrets or host env, CPU/memory/time limits. A failure caused
+             by the sandbox (no network, missing service or tool, out of memory) counts as "not tested".
              Docker not running -> build/test is skipped (reported), unless GUARDIAN_ALLOW_UNSANDBOXED=1,
              which runs the same commands locally with a cleaned environment, labelled "not sandboxed".
   5. rescan  Discovery, Dependency Graph, Container/CI, Vulnerabilities, Suspicious changes,
@@ -126,7 +127,10 @@ def _validate(scan_id: str, card_id: str, record: dict, step: Step) -> None:
 
     # 3. relock
     if applied["kind"] == "package":
-        ok, out = relock(dst / applied["project"], card, applied)
+        ok, out = True, ""
+        for project in applied["projects"]:
+            ok_p, out_p = relock(dst / project, [p for proj, p in applied["updates"] if proj == project])
+            ok, out = ok and ok_p, out + out_p
         (art / "relock.log").write_text(out, encoding="utf-8")
         if not ok:
             step("relock", "failed", "npm could not resolve a lockfile with this change", log="relock.log")
@@ -138,7 +142,7 @@ def _validate(scan_id: str, card_id: str, record: dict, step: Step) -> None:
 
     # 4. build + test
     build = {"status": "not_applicable", "detail": "Configuration change: no package build to run"}
-    if applied["kind"] == "package":
+    if applied["kind"] == "package":  # build/test the project that holds the (first) change
         build = build_and_test(dst / applied["project"], art)
     step("build_test", build["status"], build["detail"], mode=build.get("mode"), log=build.get("log"))
 
@@ -159,6 +163,8 @@ def _validate(scan_id: str, card_id: str, record: dict, step: Step) -> None:
             f"New high/critical risk appeared: {', '.join(new_risk[:5])}"
     elif build["status"] == "failed":
         status, reason = "fixed_tests_failed", "The vulnerability is gone, but the build or tests failed."
+    elif build["status"] == "env_error":
+        status, reason = "fixed_untested", "The fix removes the risk and nothing new appeared, but the sandbox could not build/test it: " + build["detail"]
     elif build["status"] in ("passed", "not_applicable"):
         status, reason = "verified", "The fix removes the risk, nothing new appeared, and the build/tests passed." \
             if build["status"] == "passed" else "The fix removes the risk and the rescan found nothing new."
@@ -186,25 +192,35 @@ def _git(cwd: Path, *args) -> str:
 # ---------------------------------------------------------------- 2. apply the card's change
 
 def apply_change(card: dict, res: dict, root: Path) -> dict:
-    ch, action = card.get("change") or {}, card["action"]
-    if action in ("upgrade", "upgrade-parent", "override", "pin", "relock"):
-        manifest = root / (ch["manifest"] if action != "relock" else ch["manifest"].replace("package-lock.json", "package.json"))
-        if not manifest.is_file():
-            return {"ok": False, "detail": f"{manifest.relative_to(root)} not found in the copy"}
-        data = json.loads(manifest.read_text(encoding="utf-8"))
-        before = json.dumps(data, indent=2)
-        if action in ("upgrade", "upgrade-parent"):
-            field = ch.get("field") or "dependencies"
-            data.setdefault(field, {})[ch["package"]] = ch["spec_to"]
-            detail = f'{ch["package"]}: "{ch.get("spec_from")}" -> "{ch["spec_to"]}" in {ch["manifest"]}'
-        elif action in ("override", "pin"):
-            data.setdefault("overrides", {})[ch["package"]] = ch["spec_to"]
-            detail = f'"overrides": {{"{ch["package"]}": "{ch["spec_to"]}"}} added to {ch["manifest"]}'
-        else:
-            detail = f"Lockfile refresh for {card['package']} (package.json unchanged)"
-        manifest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-        return {"ok": True, "kind": "package", "detail": detail, "project": manifest.parent.relative_to(root).as_posix(),
-                "diff": _mini_diff(before, json.dumps(data, indent=2), manifest.relative_to(root).as_posix())}
+    """Apply every change on the card. A card can hold several (one per route that pulls in the
+    vulnerable version, possibly in different projects); lockfile-only changes are applied by relock."""
+    action = card["action"]
+    if action in ("upgrade", "upgrade-parent", "upgrade-all", "override", "pin", "relock"):
+        changes = card.get("changes") or ([card["change"]] if card.get("change") else [])
+        details, diffs, projects, updates = [], [], [], []
+        for ch in changes:
+            manifest = root / ch["manifest"].replace("package-lock.json", "package.json")
+            if not manifest.is_file():
+                return {"ok": False, "detail": f"{manifest.relative_to(root)} not found in the copy"}
+            project = manifest.parent.relative_to(root).as_posix()
+            if project not in projects:
+                projects.append(project)
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            before = json.dumps(data, indent=2)
+            if ch.get("field") == "lockfile" or action == "relock":
+                updates.append((project, ch["package"]))
+                details.append(f"lockfile refresh: {ch['package']} -> {ch['to']} (package.json unchanged)")
+                continue
+            if action in ("override", "pin") or ch.get("field") == "overrides":
+                data.setdefault("overrides", {})[ch["package"]] = ch["spec_to"]
+                details.append(f'"overrides": {{"{ch["package"]}": "{ch["spec_to"]}"}} in {ch["manifest"]}')
+            else:
+                data.setdefault(ch.get("field") or "dependencies", {})[ch["package"]] = ch["spec_to"]
+                details.append(f'{ch["package"]}: "{ch.get("spec_from")}" -> "{ch["spec_to"]}" in {ch["manifest"]}')
+            manifest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            diffs.append(_mini_diff(before, json.dumps(data, indent=2), manifest.relative_to(root).as_posix()))
+        return {"ok": True, "kind": "package", "detail": "; ".join(details), "projects": projects, "project": projects[0],
+                "updates": updates, "diff": "\n".join(diffs)}
     if action == "config":
         return apply_config(card, res, root)
     if action == "remove":
@@ -304,18 +320,22 @@ def resolve_image_digest(image: str) -> str | None:
 
 # ---------------------------------------------------------------- 3. relock, 4. build + test
 
-def relock(project: Path, card: dict, applied: dict) -> tuple[bool, str]:
-    cmd = [NPM, "install", "--package-lock-only", "--ignore-scripts", "--package-lock=true", "--no-audit", "--no-fund"]
-    if card["action"] == "relock":
-        cmd = [NPM, "update", card["package"], "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"]
+def relock(project: Path, update: list[str]) -> tuple[bool, str]:
+    """Regenerate package-lock.json without running scripts; `update` = packages to move to the newest
+    version their existing ranges allow (lockfile-only fixes)."""
+    base = ["--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"]
+    cmds = [[NPM, "install", *base, "--package-lock=true"]] + ([[NPM, "update", *update, *base]] if update else [])
     log = ""
-    for extra in ([], ["--legacy-peer-deps"]):
-        out = subprocess.run(cmd + extra, cwd=project, capture_output=True, text=True, encoding="utf-8",
-                             errors="replace", timeout=900)
-        log += f"$ {' '.join(['npm', *cmd[1:], *extra])}\n{out.stdout}\n{out.stderr}\n"
-        if out.returncode == 0:
-            return True, log
-    return False, log
+    for cmd in cmds:
+        for extra in ([], ["--legacy-peer-deps"]):
+            out = subprocess.run(cmd + extra, cwd=project, capture_output=True, text=True, encoding="utf-8",
+                                 errors="replace", timeout=900)
+            log += f"$ {' '.join(['npm', *cmd[1:], *extra])}   (in {project.name or '.'})\n{out.stdout}\n{out.stderr}\n"
+            if out.returncode == 0:
+                break
+        else:
+            return False, log
+    return True, log
 
 
 def docker_ready() -> bool:
@@ -337,7 +357,8 @@ def node_image(project: Path) -> str:
 def build_and_test(project: Path, art: Path) -> dict:
     scripts = json.loads((project / "package.json").read_text(encoding="utf-8")).get("scripts") or {}
     phases = [("install", ["npm", "ci", "--no-audit", "--no-fund", "--legacy-peer-deps"], True)]
-    phases += [(n, ["npm", "run", n], False) for n in ("build",) if n in scripts]
+    # build may need the network (e.g. Angular inlines Google Fonts); tests run with the network off
+    phases += [(n, ["npm", "run", n], True) for n in ("build",) if n in scripts]
     phases += [("test", ["npm", "test"], False)] if "test" in scripts else []
     log_name, log = "build-test.log", []
     if docker_ready():
@@ -374,10 +395,34 @@ def build_and_test(project: Path, art: Path) -> dict:
             code = "timeout"
         (art / log_name).write_text("\n".join(log), encoding="utf-8")
         if code != 0:
+            env = environment_problem(log[-1])
+            if env:  # the sandbox, not the fix, stopped it: report as not tested
+                return {"status": "env_error", "mode": mode, "log": log_name,
+                        "detail": f"'{name}' could not run in the sandbox ({code}): {env}"}
             return {"status": "failed", "mode": mode, "log": log_name, "detail": f"'{name}' failed ({code})"}
     ran = ", ".join(n for n, _, _ in phases)
     return {"status": "passed", "mode": mode, "log": log_name, "detail": f"Passed: {ran}" +
             ("" if "test" in scripts else " (no test script)")}
+
+
+ENV_PATTERNS = [
+    (re.compile(r"EAI_AGAIN|ENOTFOUND|getaddrinfo|ENETUNREACH|network is unreachable", re.I), "no network access"),
+    (re.compile(r"ECONNREFUSED|connect ECONNREFUSED|MongoNetworkError|Redis connection", re.I),
+     "a service the tests need (database, server) is not running"),
+    (re.compile(r"command not found|: not found|is not recognized as an internal or external command", re.I),
+     "a required tool is missing in the sandbox image"),
+    (re.compile(r"ENOSPC|out of memory|JavaScript heap out of memory|Killed", re.I), "the sandbox ran out of resources"),
+]
+
+
+def environment_problem(output: str) -> str | None:
+    """Failures caused by the sandbox environment, not by the code change."""
+    for rx, why in ENV_PATTERNS:
+        m = rx.search(output)
+        if m:
+            line = next((l.strip() for l in output.splitlines() if m.group(0) in l), m.group(0))
+            return f"{why} ({line[:160]})"
+    return None
 
 
 # ---------------------------------------------------------------- 5. rescan, 6. compare

@@ -61,7 +61,7 @@ def make_scan():
 if __name__ == "__main__":
     sid, repo = make_scan()
     # fakes: no npm, no Docker, no network, no osv-scanner
-    validate.relock = lambda project, card, applied: (True, "relocked")
+    validate.relock = lambda project, update: (True, "relocked")
     validate.docker_ready = lambda: False
     validate.resolve_image_digest = lambda image: "sha256:" + "a" * 64
     after = {"components": [{"name": "bson", "version": "1.0.4"}, {"name": "mongodb", "version": "3.1.13"}],
