@@ -607,6 +607,32 @@ def start_local(project: Path, plan: dict, port: int, log_path: Path) -> dict:
     return smoke
 
 
+def _install_missing(project: Path, plan: dict, port: int, log_path: Path, venv: Path, smoke: dict, log: list) -> dict:
+    """The app stops with "No module named X" and its requirements do not list X: a gap in the original app,
+    not in the fixes. Install X into the venv (up to 3 such modules), start again, and say so plainly."""
+    from .agents.pydeps import UV, norm, read_text_any
+    listed = {norm(m.group(1)) for r in project.glob("requirements*.txt")
+              for m in re.finditer(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)", read_text_any(r), re.M)}
+    installed = []
+    while smoke["status"] != "passed" and len(installed) < 3 and UV:
+        m = re.search(r"No module named '([\w]+)", log_path.read_text(encoding="utf-8", errors="replace"))
+        pkg = norm(m.group(1)) if m else None
+        if not pkg or pkg in listed or pkg in installed:
+            break
+        out = subprocess.run([UV, "pip", "install", "-q", "--python", str(venv), pkg], cwd=project, capture_output=True,
+                             text=True, encoding="utf-8", errors="replace", timeout=600)
+        log.append(f"$ uv pip install {pkg}  [the app imports it, requirements.txt does not list it]\n{out.stdout}{out.stderr}")
+        if out.returncode:
+            break
+        installed.append(pkg)
+        smoke = start_local(project, plan, port, log_path)
+    if installed:
+        note = (f"Guardian installed {', '.join(installed)}: the app imports it but its requirements file does not list "
+                "it. That is a gap in the original app, not caused by the fixes; add it to requirements.txt.")
+        smoke = {**smoke, "auto_installed": installed, "detail": f"{smoke['detail']}. {note}"}
+    return smoke
+
+
 def _local_build_and_test(project: Path, art: Path, log_name: str, plan: dict) -> dict:
     """Local runner: install, build, start the app (left running on APP_PORT), tests. No sandbox."""
     mode = "local (no sandbox)"
@@ -633,6 +659,8 @@ def _local_build_and_test(project: Path, art: Path, log_name: str, plan: dict) -
             return {"status": "failed", "mode": mode, "log": log_name, "smoke": smoke, "detail": f"Timed out before '{name}'"}
         if name == "smoke":
             smoke = start_local(project, plan, port, art / f"app-{log_name}")
+            if py:
+                smoke = _install_missing(project, plan, port, art / f"app-{log_name}", venv, smoke, log)
             log.append(f"$ {smoke['command']} + GET {smoke['url']}  [app, on this machine]\n{smoke['log_excerpt']}")
             (art / log_name).write_text("\n".join(log), encoding="utf-8")
             continue  # tests still run, so their result is reported too
@@ -752,7 +780,9 @@ def outcome(fixed: bool, new_risk: list, build: dict) -> tuple[str, str]:
 
 
 ENV_PATTERNS = [
-    (re.compile(r"EAI_AGAIN|ENOTFOUND|getaddrinfo|ENETUNREACH|network is unreachable", re.I), "no network access"),
+    (re.compile(r"No module named '[\w.]+'|Cannot find module '[^'.][^']*'"),
+     "the app imports a module its requirements do not list (a gap in the original app, not caused by the fixes)"),
+    (re.compile(r"\b(EAI_AGAIN|ENOTFOUND|ENETUNREACH)\b|getaddrinfo|[Nn]etwork is unreachable"), "no network access"),
     (re.compile(r"ECONNREFUSED|connect ECONNREFUSED|MongoNetworkError|Redis connection", re.I),
      "a service the tests need (database, server) is not running"),
     (re.compile(r"command not found|: not found|is not recognized as an internal or external command", re.I),

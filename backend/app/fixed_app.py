@@ -52,7 +52,21 @@ def ensure_copy(scan_id: str) -> Path:
             _git(dst, "add", "-f", "--", *locks)
             _git(dst, *GIT_ID, "commit", "-q", "-m", "Guardian: baseline lockfiles (resolved at scan time)")
         _git(dst, "tag", "guardian-original")
+    _ensure_base_tag(dst)
     return dst
+
+
+def _ensure_base_tag(root: Path) -> None:
+    """guardian-original marks the unfixed app (patch, original check). A copy made by an older version may
+    lack it: put it on the baseline-lockfile commit, else on the first commit (the scanned one)."""
+    try:
+        _git(root, "rev-parse", "--verify", "-q", "guardian-original^{commit}")
+        return
+    except RuntimeError:
+        pass
+    base = _git(root, "log", "--format=%H", "--grep=^Guardian: baseline lockfiles", "-n", "1").strip() or \
+        _git(root, "rev-list", "--max-parents=0", "HEAD").split()[0]
+    _git(root, "tag", "-f", "guardian-original", base)
 
 
 def _spec_version(spec: str | None):
@@ -330,9 +344,12 @@ def _build(scan_id: str, rec: dict, step: Step) -> None:
         fixes_not_applied=[{"fix": c["title"], "why": why} for c, why in not_applied], outdated=False)
     step("rescan", "done", f"Advisories {len(before)} -> {len(after['vulnerabilities'])}; "
                            f"suspicious findings {len(b_sus)} -> {len(after['suspicious'])}")
-    (art / "fixed.patch").write_text(_git(root, "diff", "guardian-original", "HEAD", "--", ".", ":(exclude)**/node_modules/**"),
-                                     encoding="utf-8")
-    rec["patch"] = "fixed/fixed.patch"
+    try:
+        (art / "fixed.patch").write_text(_git(root, "diff", "guardian-original", "HEAD", "--", ".",
+                                              ":(exclude)**/node_modules/**"), encoding="utf-8")
+        rec["patch"] = "fixed/fixed.patch"
+    except RuntimeError as e:  # the patch is a convenience: never fail the whole run over it
+        step("patch", "failed", f"Could not write the patch file: {e}")
 
     # run the fixed app for the person to open
     if build_res.get("mode") == "docker sandbox" and smoke.get("status") == "passed":

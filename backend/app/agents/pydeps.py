@@ -170,7 +170,9 @@ def edit_requirements(path: Path, package: str, spec: str) -> tuple[str, str | N
     Returns (detail, previous spec or None if the line was added)."""
     raw = path.read_bytes()
     utf16 = raw[:2] in (b"\xff\xfe", b"\xfe\xff")
-    lines = read_text_any(path).splitlines()
+    text = read_text_any(path)
+    nl = "\r\n" if "\r\n" in text else "\n"
+    lines = text.splitlines()
     rx = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)(\[[^\]]*\])?\s*([<>=!~][^;#]*)?(.*)$")
     previous = None
     for i, line in enumerate(lines):
@@ -181,13 +183,15 @@ def edit_requirements(path: Path, package: str, spec: str) -> tuple[str, str | N
             break
     else:
         lines.append(f"{package}{spec}  # added by Supply Chain Guardian (pins a pulled-in package)")
-    text = "\n".join(lines) + "\n"
+    text = nl.join(lines) + nl
     path.write_bytes(text.encode("utf-16") if utf16 else text.encode("utf-8"))
     return (f"{package}: {previous} -> {spec}" if previous else f"added {package}{spec}"), previous
 
 
 def undo_requirements(path: Path, package: str, previous: str | None) -> None:
-    lines = read_text_any(path).splitlines()
+    text = read_text_any(path)
+    nl = "\r\n" if "\r\n" in text else "\n"
+    lines = text.splitlines()
     rx = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)(\[[^\]]*\])?\s*([<>=!~][^;#]*)?(.*)$")
     for i, line in enumerate(lines):
         m = rx.match(line)
@@ -198,7 +202,7 @@ def undo_requirements(path: Path, package: str, previous: str | None) -> None:
                 lines[i] = f"{m.group(1)}{m.group(2) or ''}{'' if previous == '(any)' else previous}{m.group(4) or ''}"
             break
     utf16 = path.read_bytes()[:2] in (b"\xff\xfe", b"\xfe\xff")
-    text = "\n".join(lines) + "\n"
+    text = nl.join(lines) + nl
     path.write_bytes(text.encode("utf-16") if utf16 else text.encode("utf-8"))
 
 
