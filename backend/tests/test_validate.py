@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import tempfile
+from pathlib import Path
 
 os.environ["GUARDIAN_DATA_DIR"] = tempfile.mkdtemp()
 os.environ["GROQ_API_KEY"] = ""
@@ -141,4 +142,16 @@ if __name__ == "__main__":
     assert rec["comparison"]["advisories_after"] == 0 and rec["comparison"]["removed"][0]["id"] == "GHSA-bson"
     assert (db.DATA / "scans" / sid / "fixed" / "fixed.patch").exists()
     assert report.build(sid)["facts"]["combined"]["fixes_rolled_back"] == 1
+    # a pin/override on a package the project lists itself goes into that field (npm EOVERRIDE otherwise)
+    t = Path(tempfile.mkdtemp())
+    (t / "package.json").write_text(json.dumps({"devDependencies": {"cypress": "^16.2.0"}}))
+    pin = {"action": "pin", "package": "cypress", "changes": [{"package": "cypress", "to": "16.3.0", "spec_to": "16.3.0",
+                                                               "field": "overrides", "manifest": "package.json"}]}
+    assert validate.apply_change(pin, {}, t)["ok"]
+    pj = json.loads((t / "package.json").read_text())
+    assert pj["devDependencies"]["cypress"] == "16.3.0" and "overrides" not in pj
+    assert pin["changes"][0]["field"] == "devDependencies" and pin["changes"][0]["spec_from"] == "^16.2.0"
+    fixed_app._undo(t, {"changes": pin["changes"]})
+    assert json.loads((t / "package.json").read_text())["devDependencies"]["cypress"] == "^16.2.0"
+    assert fixed_app.blamed_packages("npm error code EOVERRIDE\nnpm error Override for cypress@^16.2.0 conflicts") == ["cypress"]
     print("validate ok")

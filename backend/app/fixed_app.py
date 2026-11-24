@@ -168,8 +168,34 @@ def _commit_tracked(root: Path, message: str, extra: list[str] = ()) -> None:
         _git(root, *GIT_ID, "commit", "-q", "-m", message)
 
 
-def _culprit(pkg: list) -> tuple[dict, dict]:
-    """Most likely to break the build: the latest fix with a major version jump, else the latest fix."""
+NPM_BLAME = [  # npm error lines that name the package at fault
+    re.compile(r"Override for (@?[^@\s]+)@"),                 # EOVERRIDE: override clashes with a direct dependency
+    re.compile(r"While resolving: (@?[^@\s]+)@"),             # ERESOLVE
+    re.compile(r"Could not resolve dependency:\s*\n?.*?peer (@?[^@\s]+)@"),
+    re.compile(r"Conflicting peer dependency: (@?[^@\s]+)@"),
+    re.compile(r"Found: (@?[^@\s]+)@"),
+    re.compile(r"No matching version found for (@?[^@\s]+)@"),  # ETARGET
+]
+
+
+def blamed_packages(log: str) -> list[str]:
+    errors = "\n".join(l for l in log.splitlines() if "npm error" in l or "npm ERR" in l)
+    out = []
+    for rx in NPM_BLAME:
+        for name in rx.findall(errors):
+            if name not in out:
+                out.append(name)
+    return out
+
+
+def _culprit(pkg: list, log: str = "") -> tuple[dict, dict]:
+    """The fix npm's error names (EOVERRIDE, ERESOLVE, ETARGET); otherwise the latest fix with a major
+    version jump; otherwise the latest fix."""
+    for name in blamed_packages(log):
+        named = [(c, v) for c, v in pkg if any(ch.get("package") == name for ch in v.get("changes") or [])
+                 or c.get("package") == name]
+        if named:
+            return named[-1]
     major = [(c, v) for c, v in pkg if any(ch.get("jump") == "major" for ch in v.get("changes") or [])]
     return (major or pkg)[-1]
 
@@ -212,11 +238,21 @@ def _build(scan_id: str, rec: dict, step: Step) -> None:
             ok, out = ok and ok_p, out + out_p
         (art / "relock.log").write_text(out, encoding="utf-8")
         if not ok:
-            if attempt == MAX_ROLLBACKS:
-                rec.update(status="failed", reason="npm could not resolve the dependency tree, even after rollbacks.")
+            if not pkg or attempt == MAX_ROLLBACKS:
+                step("relock", "failed", "npm could not resolve the dependency tree: " +
+                     (", ".join(blamed_packages(out)) or "see the log"), log="relock.log")
+                rec.update(status="failed", reason="npm could not resolve the dependency tree, even without the package "
+                                                   "fixes (see relock.log).")
                 return
-            c, v = _culprit(pkg)
-            _rollback(scan_id, root, c, v, "npm could not resolve the dependency tree with this fix", out[-4000:], rec, step)
+            if attempt == MAX_ROLLBACKS - 1:  # last resort: undo every package fix so the app runs again
+                for c, v in reversed(pkg):
+                    _rollback(scan_id, root, c, v, "npm could not resolve the package fixes together; all package "
+                              "fixes were rolled back so the app runs", out[-4000:], rec, step)
+                continue
+            c, v = _culprit(pkg, out)
+            blamed = blamed_packages(out)
+            _rollback(scan_id, root, c, v, "npm could not resolve the dependency tree with this fix"
+                      + (f" (npm named {', '.join(blamed[:3])})" if blamed else ""), out[-4000:], rec, step)
             continue
         _commit_tracked(root, "Guardian: regenerate lockfiles",
                         [f"{p}/package-lock.json".lstrip("./") or "package-lock.json" for p in projects
@@ -232,8 +268,8 @@ def _build(scan_id: str, rec: dict, step: Step) -> None:
                 _rollback(scan_id, root, c, v, "the app still did not build with the package fixes together; "
                           "all package fixes were rolled back so the app runs", "", rec, step)
             continue
-        c, v = _culprit(pkg)
         log_text = (art / build_res["log"]).read_text(encoding="utf-8")[-4000:] if build_res.get("log") else ""
+        c, v = _culprit(pkg, log_text)
         _rollback(scan_id, root, c, v, "the build or the app broke with this fix", log_text, rec, step)
     step("build_test", build_res["status"], build_res["detail"], mode=build_res.get("mode"), log=build_res.get("log"))
     smoke = build_res.get("smoke") or {}

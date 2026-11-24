@@ -203,7 +203,16 @@ def apply_change(card: dict, res: dict, root: Path) -> dict:
                 updates.append((project, ch["package"]))
                 details.append(f"lockfile refresh: {ch['package']} -> {ch['to']} (package.json unchanged)")
                 continue
-            if action in ("override", "pin") or ch.get("field") == "overrides":
+            direct_field = next((f for f in ("dependencies", "devDependencies", "optionalDependencies")
+                                 if ch["package"] in (data.get(f) or {})), None)
+            if (action in ("override", "pin") or ch.get("field") == "overrides") and direct_field:
+                # npm refuses an override that conflicts with a direct dependency (EOVERRIDE): for a package the
+                # project lists itself, set the version right there instead
+                ch["field"], ch["spec_from"] = direct_field, data[direct_field][ch["package"]]
+                data[direct_field][ch["package"]] = ch["spec_to"]
+                details.append(f'{ch["package"]}: "{ch["spec_from"]}" -> "{ch["spec_to"]}" in {ch["manifest"]} ({direct_field})')
+            elif action in ("override", "pin") or ch.get("field") == "overrides":
+                ch["field"] = "overrides"
                 data.setdefault("overrides", {})[ch["package"]] = ch["spec_to"]
                 details.append(f'"overrides": {{"{ch["package"]}": "{ch["spec_to"]}"}} in {ch["manifest"]}')
             else:
