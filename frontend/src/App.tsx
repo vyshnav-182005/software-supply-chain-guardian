@@ -23,7 +23,7 @@ const TABS = [
   ['investigate', 'Investigation'],
   ['prioritize', 'Prioritized risks'],
   ['remediate', 'Fixes & approval'],
-  ['validation', 'Validation & report'],
+  ['validation', 'Fixed app & report'],
 ] as const
 type Tab = (typeof TABS)[number][0]
 
@@ -186,7 +186,7 @@ function ScanPage({ id, theme }: { id: string; theme: Theme }) {
       if (r?.ok) {
         const s: Scan = await r.json()
         setScan(s)
-        const validating = Object.values(s.validations ?? {}).some((v) => v.status === 'queued' || v.status === 'running')
+        const validating = Object.values(s.validations ?? {}).some((v) => ['queued', 'running', 'applying'].includes(v.status))
         if ((s.status === 'completed' || s.status === 'failed' || s.status === 'cancelled') && !validating) return
       }
       timer = window.setTimeout(load, 2000)

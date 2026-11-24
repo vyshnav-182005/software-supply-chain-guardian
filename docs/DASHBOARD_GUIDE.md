@@ -24,7 +24,7 @@ Contents
 12. [Tab: Investigation](#12-tab-investigation)
 13. [Tab: Prioritized risks](#13-tab-prioritized-risks)
 14. [Tab: Fixes & approval](#14-tab-fixes--approval)
-15. [Tab: Validation & report](#15-tab-validation--report)
+15. [Tab: Fixed app & report](#15-tab-fixed-app--report)
 16. [How the numbers connect across tabs](#16-how-the-numbers-connect-across-tabs)
 17. [Facts, AI inference and the Validator](#17-facts-ai-inference-and-the-validator)
 18. [Glossary](#18-glossary)
@@ -52,14 +52,14 @@ Contents
                               │
                     12 Human Approval ── you click Approve / Reject
                               │
-                    13 Validate (on Approve: apply on a branch, build/test in Docker, rescan)
+                    13 Fixed app (each Approve applies its fix to one fixed copy; build, verify, run it)
                               │
                     14 Report (before vs after, remaining risk, audit trail)
 ```
 
 Agents 1 to 12 run automatically, one after another, when you start a scan. Agents 13 and 14 run
 after you approve fixes. **No code from the scanned repository is ever executed during a scan.**
-Validate runs the project's build and tests only after your approval, and only inside a Docker sandbox.
+The fixed app is built, tested and run only after your approval, and only in Docker.
 
 ---
 
@@ -111,8 +111,8 @@ running** to build and test fixes.
 7. **Investigation** → what the agent found inside those packages and files.
 8. **Prioritized risks** → the single ranked list with the formula on every row.
 9. **Fixes & approval** → read a card's explanation, click **Approve**.
-10. **Validation & report** → watch the fix being applied, built, tested and rescanned; download
-    the Markdown report.
+10. **Fixed app & report** → click **Build, run & verify fixed app**; when it finishes, click **Open app**
+    to use the fixed Juice Shop at http://localhost:3001, and compare original vs fixed.
 
 ---
 
@@ -401,8 +401,8 @@ high 6, medium 17, low 9**. Older scans made before that rule showed 42 rows, be
 
 ## 14. Tab: Fixes & approval
 
-One **fix card** per change. Juice Shop (current rules): about **18 cards**: 6 for known
-vulnerabilities, 5 pin-and-review cards for risky packages, 7 config fixes.
+One **fix card** per change, for **every** risk band (critical to low), in priority order: upgrades for
+known vulnerabilities, pin-and-review cards for risky packages, and config fixes.
 
 **Each card**
 
@@ -412,8 +412,13 @@ vulnerabilities, 5 pin-and-review cards for risky packages, 7 config fixes.
   `lodash 2.4.2  9.5 → 0.0`, because the new sanitize-html no longer pulls in the old lodash.
 - **Explanation**: 2 to 3 plain sentences: what is wrong, what the change does, what might break.
   "AI explanation" when written by the AI (and checked), "Explanation" when generated from the rules.
-- **Approve / Reject**: records your decision with the time. **Approve also starts Validate.**
-  After a decision the card shows ✓ Approved / ✕ Rejected and a validation badge.
+- **Approve / Reject**: **Approve applies the change to the fixed copy of the app** (one copy per scan,
+  branch `fix/guardian`; the scanned original is never touched). Fixes add up: each Approve goes on top of
+  the earlier ones, and a later fix never lowers a version an earlier fix raised. Reject leaves it out.
+  The card then shows its status: ✅ Applied, ✅ Already covered (an earlier fix did it), ❌ Couldn't
+  apply (with the reason), Needs a manual change (replace/remove cards), ↩ Rolled back (it broke the build
+  or the app), ⚠️ Applied, still present (the rescan still finds it, e.g. another route pulls it in).
+- **Test this fix alone** (optional link): builds and rescans just this fix on its own branch.
 - **Show details**: the exact change and `package.json` / file diff, packages fixed together, risk
   reduction (advisories and CVEs removed, what is still open), rollback, version jump
   (patch / minor / major), the AI's breaking-change notes and the app code that uses the package.
@@ -424,9 +429,8 @@ picked, **after checking with OSV that the new versions have no known high or cr
 that would introduce one are skipped, and the card says which). If any route has no safe version, the card
 uses an npm `overrides` pin instead.
 
-**Card colour**: rejected cards are grey. Approved cards are coloured by their validation result: green ✅
-verified, amber ⚠️ fixed but not tested / tests failed, red ❌ not fixed or new risk, blue while queued or
-running. "✓ Approved" itself is neutral.
+**Card colour** follows the card's status: green applied, amber applied but still present, red couldn't
+apply or rolled back, blue applying or manual, grey rejected. "✓ Approved" itself is neutral.
 
 **Card types (actions)**
 
@@ -444,77 +448,50 @@ running. "✓ Approved" itself is neutral.
 
 ---
 
-## 15. Tab: Validation & report
+## 15. Tab: Fixed app & report
 
-### Validation of approved fixes
+### The fixed application
 
-For each approved card, the steps run in order (live):
+Every approved fix is already applied to one copy of the project. **Build, run & verify fixed app** then:
 
-1. **copy**: the scanned repo is copied to `backend\data\workspaces\<scan>\fix-<card>` on branch
-   `fix/<package>-<version>`. The original is never changed.
-2. **apply**: the card's exact change (shown as a diff). For config fixes the action's commit SHA is
-   looked up with `git ls-remote` and the image digest from its registry.
-3. **relock**: `npm install --package-lock-only --ignore-scripts` (package changes only). Log link.
-4. **build / test**: in Docker: `npm ci` and `npm run build` with the network on (downloads, and
-   e.g. Angular inlining Google Fonts), then `npm test` with the network off; 2 CPUs, 4 GB memory, a
-   time limit and no secrets. If the sandbox itself stops it (no network, a database the tests need,
-   a missing tool, out of memory) the result is "not tested", not "tests failed". Without Docker
-   this step is skipped and says why. Log link.
-5. **rescan**: the same rule-based agents on the fixed copy (no AI), then a comparison.
+1. **relock**: regenerates `package-lock.json` for all the applied fixes (no scripts run);
+2. **build**: in Docker, `npm ci` and `npm run build` (network on for downloads such as Google Fonts);
+3. **app check**: starts the app inside the sandbox (network off) and requests `GET /` on port 3000:
+   "App check in the sandbox: GET / → HTTP 200" plus the end of the app's log;
+4. **tests**: `npm test` with the network off. If the sandbox stops them (they need Chrome or a database,
+   no network, out of memory) that is reported as "not run", not as a failure;
+5. **rollback if needed**: if npm cannot resolve the tree, or the build or app breaks, the most recent
+   package fix is undone (its card shows ↩ Rolled back with the log) and the rest is tried again
+   (up to 3 times);
+6. **rescan** of the fixed copy with the same agents, and the comparison below;
+7. **run it for you**: the fixed app is started in Docker and published on **http://localhost:3001**.
+   **Open app** opens it in your browser; **Stop app** stops it.
 
-**Result badge** (also shown on the fix card):
+**Result badge**: ✅ Fixed app runs, ⚠️ Built, app not confirmed, ❌ Build failed. A note appears if more
+fixes were approved after the last build ("build again to include them").
 
-| Badge | Meaning |
-|---|---|
-| ✅ Verified | the target vulnerability/finding is gone, nothing new appeared, build/tests passed (or not needed) |
-| ✅ Fixed, app runs (tests not run) | fixed, nothing new, the app started and answered `GET /` (e.g. HTTP 200), but the test suite could not run in the sandbox (e.g. it needs Chrome or a database) |
-| ⚠️ Fixed, not tested | fixed and nothing new, but build/tests did not run (Docker not running) |
-| ⚠️ Fixed, tests failed | fixed, but the build or tests failed. The AI explains why from the log |
-| ❌ Not fixed / new risk | the target is still there, or a new high/critical risk appeared |
-| Needs a manual change | replace/remove cards, or a change the agent cannot make safely |
+**Original vs fixed**: advisories per severity, total advisories, suspicious findings and package counts,
+before and after. **Removed**: every advisory that is gone. **Still there, and why**: every advisory that
+remains, with its reason: "no fixed version has been published" (e.g. marsdb), "fix rejected", "fix not
+approved yet", "fix applied, but another route still pulls in this version", "needs a manual change", or
+"new: brought in by one of the upgrades". Nothing is hidden: Juice Shop is deliberately vulnerable and some
+packages have no fix.
 
-**Before → after**: advisories before and after, packages added / removed / changed (e.g.
-`bson 1.0.9 -> 1.0.4`), and any new advisories. **Run validation again** re-runs it (for example
-after starting Docker).
-
-Fixes are validated **one at a time**, in the order you approved them (a Juice Shop build/test can take
-up to 20 minutes). **Cancel** removes a queued validation, **Stop after the current step** stops a running
-one, and **Cancel all N queued** clears the queue, so you can keep just one or two fixes for a demo.
-The branch is named after the package that is changed, e.g. `fix/sanitize-html-2.18.0`.
-
-### All approved fixes together (branch `fix/combined`)
-
-Click **Validate all approved fixes together** after approving the fixes you want. It:
-
-1. copies the scanned repo to `fix-combined` on branch `fix/combined`;
-2. applies **every** approved fix at once. When two fixes change the same package (a shared parent
-   such as express-jwt), the higher target version wins. Config fixes are applied too. Cards that need a
-   person (replace / remove) are listed as "not applied";
-3. relocks once, runs `npm ci` and the build;
-4. **starts the app** in the sandbox (`npm start`, network off), waits for port 3000 and requests `GET /`.
-   "**App runs ✅ GET / → HTTP 200**" plus the end of the app's log is the proof that the application still
-   works with all fixes in place;
-5. runs the tests, then rescans once.
-
-It then shows advisories **before → after** by severity, and **every advisory that remains, with the honest
-reason**: "no fixed version has been published" (e.g. marsdb), "fix rejected", "fix not approved yet",
-"below the fix threshold" (low/medium risks without a card), "fix applied, but another route still pulls in
-this version", "needs a manual change", or "new: brought in by one of the upgrades". Nothing is hidden:
-Juice Shop is deliberately vulnerable and some packages have no fix at all.
+**Download the fix as a patch**: the exact changes (package.json, lockfiles, Dockerfile, workflows) as a
+git patch you can apply to the real repository.
 
 ### Report
 
 - **Summary**: written by the AI only from the verified numbers (any other number is rejected), or a
   rule-generated sentence.
-- **Before / after table**: risk counts per band. "After" subtracts only ✅ Verified fixes.
-- **All fixes together** (in the Markdown export): advisories before → after, whether the app runs, and
-  the table of remaining advisories with their reasons.
 - **Remaining risk**: open, rejected, accepted (low band or not reachable), awaiting decision, resolved.
-- **Audit trail**: for every card: finding (score and formula) → decision (who, when) → validation
-  result and rescan summary.
-- **Report (Markdown) / JSON**: the full report for download.
+- **Audit trail**: for every card: finding (score) → decision (when) → its status in the fixed app.
+- **Report (Markdown) / JSON**: the full report, including the fixed-app section (advisories before → after,
+  whether the app runs, removed and remaining advisories with reasons).
 
----
+### Single-fix tests (optional)
+
+Fixes tested alone with **Test this fix alone** appear here with their own steps and logs.
 
 ## 16. How the numbers connect across tabs
 
@@ -527,7 +504,7 @@ Juice Shop is deliberately vulnerable and some packages have no fix at all.
 | 91 evidence bundles | Evidence report | 57 advisories + 34 suspicious findings |
 | Evidence report "initial risk" vs Prioritized bands | Evidence / Prioritized | initial risk is per advisory and simple; Prioritized is one row per package with the full formula |
 | Prioritized rows (≈34) | Prioritized risks | 22 CVE packages + 5 risky packages + risky config findings |
-| Fix cards (≈18) | Fixes & approval | top CVE risks (critical/high) + one card per supply-chain/config row; changes that fix several packages are merged into one card |
+| Fix cards | Fixes & approval | one per change for every band (critical to low) + one per supply-chain/config row; changes that fix several packages are merged into one card |
 
 ---
 

@@ -335,3 +335,8 @@ button.reject { background: var(--bad); color: #2a0606; }
 .app-run.ok { background: rgba(52, 211, 153, .12); border: 1px solid rgba(52, 211, 153, .4); }
 .app-run.bad { background: rgba(248, 113, 113, .1); border: 1px solid rgba(248, 113, 113, .4); }
 .fixcard.v-fixed_app_runs { border-left: 4px solid var(--ok); }
+/* fix cards in the fixed copy */
+.fixcard.v-applied, .fixcard.v-already_applied { border-left: 4px solid var(--ok); }
+.fixcard.v-applied_still_present { border-left: 4px solid var(--warn); }
+.fixcard.v-apply_failed, .fixcard.v-rolled_back { border-left: 4px solid var(--bad); }
+.fixcard.v-applying, .fixcard.v-manual { border-left: 4px solid var(--accent-2); }

@@ -29,8 +29,8 @@ export default function FixesTab({ scanId, data, decisions, onDecided, risks = [
   return (
     <div className="day2">
       <p className="small muted">
-        Each card is one recommended fix. Read the explanation, then approve or reject it. Approving records your decision
-        only; nothing in the repository is changed. {decided.filter((d) => d.decision === 'approved').length} approved ·{' '}
+        Each card is one recommended fix. Read the explanation, then approve or reject it. <b>Approve applies the change</b> to
+        the fixed copy of the app (the scanned original is untouched); then build, run and verify it on the Fixed app &amp; report tab. {decided.filter((d) => d.decision === 'approved').length} approved ·{' '}
         {decided.filter((d) => d.decision === 'rejected').length} rejected · {data.cards.length - decided.length} waiting
       </p>
       {data.errors.length > 0 && <div className="alert">Could not plan a fix for: {data.errors.map((e) => `${e.package} (${e.error})`).join('; ')}</div>}
@@ -90,6 +90,11 @@ function Card({ c, pkgs, scanId, decision, validation, onDecided }: { c: FixCard
             <button className="reject" disabled={busy} onClick={() => decide('rejected')}>Reject</button>
           </>
         )}
+        {decision?.decision === 'approved' && ['applied', 'already_applied', 'applied_still_present'].includes(validation?.status ?? '') && (
+          <button className="link" title="Optional: build and rescan this fix alone on its own branch"
+                  onClick={() => fetch(`/api/scans/${scanId}/validations/${c.id}`, { method: 'POST' }).then(onDecided)}>Test this fix alone</button>
+        )}
+        {validation?.reason && validation.status !== 'applied' && <span className="small muted">{validation.reason}</span>}
         <button className="link details-toggle" onClick={() => setOpen(!open)}>{open ? 'Hide details' : 'Show details'}</button>
         {err && <span className="note small">{err}</span>}
       </div>
