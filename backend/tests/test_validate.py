@@ -74,7 +74,7 @@ if __name__ == "__main__":
     fix = db.DATA / "workspaces" / sid / "fix-c1"
     assert json.loads((fix / "package.json").read_text())["dependencies"]["mongodb"] == "^3.1.13"
     assert json.loads((repo / "package.json").read_text())["dependencies"]["mongodb"] == "^2.2.36"  # original untouched
-    assert v["branch"] == "fix/bson-1.0.9" and "Docker is not running" in v["build"]["detail"]
+    assert v["branch"] == "fix/mongodb-3.1.13" and "Docker is not running" in v["build"]["detail"]
     assert v["comparison"]["sbom_diff"]["changed"] == ["bson 1.0.9 -> 1.0.4", "mongodb 2.2.36 -> 3.1.13"]
     assert [s["name"] for s in v["steps"]] == ["copy", "apply", "relock", "build_test", "rescan"]
 

@@ -11,6 +11,7 @@ export const VSTATUS: Record<string, { label: string; cls: string }> = {
   not_fixed: { label: '❌ Not fixed / new risk', cls: 'critical' },
   manual: { label: 'Needs a manual change', cls: 'unrated' },
   error: { label: 'Validation error', cls: 'critical' },
+  cancelled: { label: 'Cancelled', cls: 'unrated' },
 }
 
 export function ValidationBadge({ v }: { v?: Validation }) {
@@ -37,6 +38,12 @@ export default function ValidationTab({ scanId, cards, validations, onRerun }: {
     fetch(`/api/scans/${scanId}/report`).then((r) => (r.ok ? r.json() : Promise.reject(r.statusText)))
       .then(setRep).catch((e) => setErr(String(e)))
   }, [scanId, key])
+
+  async function cancel(cardIds: string[]) {
+    for (const id of cardIds) await fetch(`/api/scans/${scanId}/validations/${id}`, { method: 'DELETE' }).catch(() => null)
+    onRerun()
+  }
+  const queued = Object.values(validations).filter((v) => v.status === 'queued').map((v) => v.card_id)
 
   async function rerun(cardId: string) {
     const r = await fetch(`/api/scans/${scanId}/validations/${cardId}`, { method: 'POST' }).catch(() => null)
@@ -70,7 +77,11 @@ export default function ValidationTab({ scanId, cards, validations, onRerun }: {
       {err && <div className="alert">{err}</div>}
 
       <section className="card">
-        <h2>Validation of approved fixes</h2>
+        <div className="row-between">
+          <h2>Validation of approved fixes</h2>
+          {queued.length > 0 && <button className="link" onClick={() => cancel(queued)}>Cancel all {queued.length} queued</button>}
+        </div>
+        <p className="small muted">Fixes are validated one at a time, in the order they were approved.</p>
         {Object.keys(validations).length === 0 && <p className="muted">No fix has been approved yet. Approve a card on the Fixes &amp; approval tab to start its validation.</p>}
         {cards.filter((c) => validations[c.id]).map((c) => {
           const v = validations[c.id]
@@ -99,7 +110,9 @@ export default function ValidationTab({ scanId, cards, validations, onRerun }: {
                 </div>
               )}
               {v.ai?.ok && <div className="explain"><div className="explain-label">AI: why the build/tests failed</div><p>{v.ai.answer?.explanation}</p></div>}
-              {v.status !== 'queued' && v.status !== 'running' && <button className="link" onClick={() => rerun(c.id)}>Run validation again</button>}
+              {v.status === 'queued' || v.status === 'running'
+                ? <button className="link" onClick={() => cancel([c.id])}>{v.status === 'queued' ? 'Cancel' : 'Stop after the current step'}</button>
+                : <button className="link" onClick={() => rerun(c.id)}>Run validation again</button>}
             </div>
           )
         })}

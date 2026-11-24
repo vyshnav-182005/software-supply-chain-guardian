@@ -39,6 +39,11 @@ DOCKER = shutil.which("docker")
 TIMEOUT = int(os.environ.get("GUARDIAN_VALIDATE_TIMEOUT", "1200"))  # seconds for build + test together
 ALLOW_UNSANDBOXED = os.environ.get("GUARDIAN_ALLOW_UNSANDBOXED") == "1"
 _lock = threading.Lock()  # ponytail: one validation at a time (npm + rescans are heavy)
+CANCELLED: set[tuple[str, str]] = set()  # (scan, card) asked to stop; checked before each step
+
+
+class Cancelled(Exception):
+    pass
 GIT_ID = ["-c", "user.name=Supply Chain Guardian", "-c", "user.email=guardian@localhost"]
 
 AI_SYSTEM = """A dependency fix was applied and the project's build or tests failed. Using ONLY the
@@ -56,6 +61,8 @@ class Step:
         self.scan_id, self.card_id, self.r = scan_id, card_id, record
 
     def __call__(self, name: str, status: str, detail: str = "", **extra):
+        if (self.scan_id, self.card_id) in CANCELLED:
+            raise Cancelled()
         steps = self.r.setdefault("steps", [])
         row = next((s for s in steps if s["name"] == name), None)
         if row is None:
@@ -67,16 +74,21 @@ class Step:
 
 def run(scan_id: str, card_id: str) -> None:
     record = {"card_id": card_id, "status": "queued", "steps": []}
-    db.save_validation(scan_id, card_id, record)
     with _lock:
+        if (scan_id, card_id) in CANCELLED or db.validations(scan_id).get(card_id, {}).get("status") == "cancelled":
+            CANCELLED.discard((scan_id, card_id))
+            return  # cancelled while it was waiting in the queue
         record["status"] = "running"
         record["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         step = Step(scan_id, card_id, record)
         try:
             _validate(scan_id, card_id, record, step)
+        except Cancelled:
+            record.update(status="cancelled", reason="Stopped by user")
         except Exception as e:  # never leave a card "running" forever
             traceback.print_exc()
             record.update(status="error", reason=f"{type(e).__name__}: {str(e)[:300]}")
+        CANCELLED.discard((scan_id, card_id))
         record["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         db.save_validation(scan_id, card_id, record)
 
@@ -88,7 +100,9 @@ def _validate(scan_id: str, card_id: str, record: dict, step: Step) -> None:
     src = db.DATA / "workspaces" / scan_id / "repo"
     dst = db.DATA / "workspaces" / scan_id / f"fix-{card_id}"
     art = db.DATA / "scans" / scan_id / f"fix-{card_id}"
-    branch = "fix/" + re.sub(r"[^A-Za-z0-9._-]+", "-", f"{card['package']}-{card['version']}".strip("-"))[:60]
+    ch = card.get("change") or {}
+    name = f"{ch['package']}-{ch['to']}" if ch.get("package") and ch.get("to") else f"{card['package']}-{card['version']}"
+    branch = "fix/" + re.sub(r"[^A-Za-z0-9._-]+", "-", name.strip("-"))[:60]  # named after what is changed
     record.update(branch=branch, workspace=dst.relative_to(db.DATA).as_posix(), card_title=card["title"])
 
     # 1. copy
@@ -190,7 +204,7 @@ def apply_change(card: dict, res: dict, root: Path) -> dict:
             detail = f"Lockfile refresh for {card['package']} (package.json unchanged)"
         manifest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
         return {"ok": True, "kind": "package", "detail": detail, "project": manifest.parent.relative_to(root).as_posix(),
-                "diff": _mini_diff(before, json.dumps(data, indent=2))}
+                "diff": _mini_diff(before, json.dumps(data, indent=2), manifest.relative_to(root).as_posix())}
     if action == "config":
         return apply_config(card, res, root)
     if action == "remove":
@@ -198,9 +212,10 @@ def apply_change(card: dict, res: dict, root: Path) -> dict:
     return {"ok": False, "detail": "No published fix: the package has to be replaced or its use limited by a person."}
 
 
-def _mini_diff(a: str, b: str) -> str:
+def _mini_diff(a: str, b: str, name: str = "package.json") -> str:
     import difflib
-    return "\n".join(l for l in difflib.unified_diff(a.splitlines(), b.splitlines(), lineterm="", n=1))[:3000]
+    return "\n".join(l for l in difflib.unified_diff(a.splitlines(), b.splitlines(), fromfile=f"a/{name}",
+                                                      tofile=f"b/{name}", lineterm="", n=1))[:3000]
 
 
 def config_item(card: dict, res: dict) -> dict | None:
@@ -245,7 +260,8 @@ def apply_config(card: dict, res: dict, root: Path) -> dict:
     lines[n] = new
     path.write_text("".join(lines), encoding="utf-8")
     return {"ok": True, "kind": "config", "detail": f"{item['file']}:{item['line']}: {old.strip()}  ->  {new.strip()}",
-            "diff": f"-{old.rstrip()}\n+{new.rstrip()}", "finding": item}
+            "diff": f"--- a/{item['file']}\n+++ b/{item['file']}\n@@ line {item['line']} @@\n-{old.rstrip()}\n+{new.rstrip()}",
+            "finding": item}
 
 
 def resolve_action_sha(owner: str, repo: str, ref: str) -> str | None:

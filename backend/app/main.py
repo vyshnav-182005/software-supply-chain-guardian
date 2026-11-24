@@ -82,6 +82,18 @@ def revalidate(scan_id: str, card_id: str, bg: BackgroundTasks):
     return {"status": "queued"}
 
 
+@app.delete("/api/scans/{scan_id}/validations/{card_id}")
+def cancel_validation(scan_id: str, card_id: str):
+    """Cancel a queued validation, or stop a running one before its next step."""
+    v = db.validations(scan_id).get(card_id)
+    if not v or v.get("status") not in ("queued", "running"):
+        raise HTTPException(409, "This validation is not queued or running")
+    validate.CANCELLED.add((scan_id, card_id))
+    if v["status"] == "queued":
+        db.save_validation(scan_id, card_id, {**v, "status": "cancelled", "reason": "Cancelled before it started"})
+    return {"status": "cancelling" if v["status"] == "running" else "cancelled"}
+
+
 @app.get("/api/scans/{scan_id}/report")
 def final_report(scan_id: str, format: Literal["json", "md"] = "json"):
     """Agent 14: before/after, remaining risk, audit trail, summary. ?format=md downloads Markdown."""

@@ -463,6 +463,11 @@ For each approved card, the steps run in order (live):
 `bson 1.0.9 -> 1.0.4`), and any new advisories. **Run validation again** re-runs it (for example
 after starting Docker).
 
+Fixes are validated **one at a time**, in the order you approved them (a Juice Shop build/test can take
+up to 20 minutes). **Cancel** removes a queued validation, **Stop after the current step** stops a running
+one, and **Cancel all N queued** clears the queue, so you can keep just one or two fixes for a demo.
+The branch is named after the package that is changed, e.g. `fix/sanitize-html-2.18.0`.
+
 ### Report
 
 - **Summary**: written by the AI only from the verified numbers (any other number is rejected), or a
